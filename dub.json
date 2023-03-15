@@ -17,12 +17,19 @@
     "subPackages": [
         "./vibed/"
     ],
+    "stringImportPaths": [
+        "lib/"
+    ],
     "buildTypes": {
+        "release": {
+            "libs": ["libcrypto", "libssl"]
+        },
         "debug": {
             "buildOptions": ["debugMode", "debugInfo"],
             "dflags-dmd": ["-debug=requests", "-debug=httpd", "-g"],
             "dflags-ldc": ["-d-debug=requests"],
-            "versions": ["httpbin"]
+            "versions": ["httpbin"],
+            "libs": ["libcrypto_d", "libssl_d"]
         },
         "docs": {
             "buildOptions": ["syntaxOnly"],
