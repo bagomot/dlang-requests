@@ -9,6 +9,8 @@ import core.sys.posix.dlfcn;
 import std.experimental.logger;
 import core.stdc.config;
 
+import deimos.openssl.evp;
+
 version(Windows) {
     import core.sys.windows.windows;
     alias DLSYM = GetProcAddress;
@@ -58,6 +60,7 @@ private alias Version = Tuple!(int, "major", int, "minor");
 immutable static OpenSSL openssl;
 
 shared static this() {
+    
     // version(OSX) {
     //     enum loadFunction = "dlopen(lib.ptr, RTLD_LAZY)";
     //     immutable string[] libsslname = [

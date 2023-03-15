@@ -1,50 +1,87 @@
 {
-    "name": "requests",
-    "description": "http/ftp client library, inspired by python-requests",
-    "copyright": "Copyright © 2016, igor",
-    "authors": ["ikod"],
-    "license": "BSL-1.0",
-    "sourcePaths": ["source"],
-    "importPaths": ["source"],
-    "dependencies": {
-        "cachetools": "~>0"
-    },
-    "configurations": [
-        {
-            "name": "std"
-        }
-    ],
-    "subPackages": [
-        "./vibed/"
-    ],
-    "stringImportPaths": [
-        "lib/"
-    ],
-    "buildTypes": {
-        "release": {
-            "libs": ["libcrypto", "libssl"]
-        },
-        "debug": {
-            "buildOptions": ["debugMode", "debugInfo"],
-            "dflags-dmd": ["-debug=requests", "-debug=httpd", "-g"],
-            "dflags-ldc": ["-d-debug=requests"],
-            "versions": ["httpbin"],
-            "libs": ["libcrypto_d", "libssl_d"]
-        },
-        "docs": {
-            "buildOptions": ["syntaxOnly"],
-            "dflags" : ["-c", "-Dddocs"]
-        },
-        "unittest": {
-            "buildOptions": ["unittests", "debugMode", "debugInfo"],
-            "versions": ["httpbin"],
-            "debugVersions": ["requests", "httpd"],
-            "sourcePaths": ["tests"]
-        },
-        "localtest": {
-            "buildOptions": ["unittests", "debugMode", "debugInfo"],
-            "versions": ["localtest"],
-            "sourcePaths": ["source", "tests"]
-        }
-    }
+	"authors": [
+		"ikod"
+	],
+	"buildTypes": {
+		"debug": {
+			"buildOptions": [
+				"debugMode",
+				"debugInfo"
+			],
+			"dflags-dmd": [
+				"-debug=requests",
+				"-debug=httpd",
+				"-g"
+			],
+			"dflags-ldc": [
+				"-d-debug=requests"
+			],
+			"versions": [
+				"httpbin"
+			]
+		},
+		"docs": {
+			"buildOptions": [
+				"syntaxOnly"
+			],
+			"dflags": [
+				"-c",
+				"-Dddocs"
+			]
+		},
+		"localtest": {
+			"buildOptions": [
+				"debugMode",
+				"debugInfo",
+				"unittests"
+			],
+			"sourcePaths": [
+				"source",
+				"tests"
+			],
+			"versions": [
+				"localtest"
+			]
+		},
+		"unittest": {
+			"buildOptions": [
+				"debugMode",
+				"debugInfo",
+				"unittests"
+			],
+			"debugVersions": [
+				"requests",
+				"httpd"
+			],
+			"sourcePaths": [
+				"tests"
+			],
+			"versions": [
+				"httpbin"
+			]
+		}
+	},
+	"configurations": [
+		{
+			"name": "std",
+			"targetType": "library"
+		}
+	],
+	"copyright": "Copyright © 2016, igor",
+	"dependencies": {
+		"cachetools": "~>0",
+		"openssl-static": "~>1.0.2"
+	},
+	"description": "http/ftp client library, inspired by python-requests",
+	"importPaths": [
+		"source"
+	],
+	"license": "BSL-1.0",
+	"name": "requests",
+	"sourcePaths": [
+		"source"
+	],
+	"subPackages": [
+		"./vibed/"
+	]
 }
