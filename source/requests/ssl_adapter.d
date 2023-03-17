@@ -61,102 +61,102 @@ immutable static OpenSSL openssl;
 
 shared static this() {
     
-    // version(OSX) {
-    //     enum loadFunction = "dlopen(lib.ptr, RTLD_LAZY)";
-    //     immutable string[] libsslname = [
-    //         "libssl.46.dylib",
-    //         "libssl.44.dylib",
-    //         "libssl.43.dylib",
-    //         "libssl.35.dylib",
-    //         "libssl.dylib",
-    //     ];
-    //     immutable string[] libcryptoname = [
-    //         "libcrypto.44.dylib",
-    //         "libcrypto.42.dylib",
-    //         "libcrypto.41.dylib",
-    //         "libcrypto.35.dylib",
-    //         "libcrypto.dylib",
-    //     ];
-    // } else
-    // version(linux) {
-    //     enum loadFunction = "dlopen(lib.ptr, RTLD_LAZY)";
-    //     immutable string[] libsslname = [
-    //         "libssl.so.3",
-    //         "libssl.so.1.1",
-    //         "libssl.so.1.0.2",
-    //         "libssl.so.1.0.1",
-    //         "libssl.so.1.0.0",
-    //         "libssl.so",
-    //     ];
-    //     immutable string[] libcryptoname = [
-    //         "libcrypto.so.3",
-    //         "libcrypto.so.1.1",
-    //         "libcrypto.so.1.0.2",
-    //         "libcrypto.so.1.0.1",
-    //         "libcrypto.so.1.0.0",
-    //         "libcrypto.so",
-    //     ];
-    // } else
-    // version(FreeBSD) {
-    //     enum loadFunction = "dlopen(lib.ptr, RTLD_LAZY)";
-    //     immutable string[] libsslname = [
-    //         "libssl.so.1.1",
-    //         "libssl.so.1.0.2",
-    //         "libssl.so.1.0.1",
-    //         "libssl.so.1.0.0",
-    //         "libssl.so",
-    //     ];
-    //     immutable string[] libcryptoname = [
-    //         "libcrypto.so.1.1",
-    //         "libcrypto.so.1.0.2",
-    //         "libcrypto.so.1.0.1",
-    //         "libcrypto.so.1.0.0",
-    //         "libcrypto.so",
-    //     ];
-    // } else
-    // version(Windows) {
-    //     enum loadFunction = "LoadLibrary(lib.ptr)";
+    version(OSX) {
+        enum loadFunction = "dlopen(lib.ptr, RTLD_LAZY)";
+        immutable string[] libsslname = [
+            "libssl.46.dylib",
+            "libssl.44.dylib",
+            "libssl.43.dylib",
+            "libssl.35.dylib",
+            "libssl.dylib",
+        ];
+        immutable string[] libcryptoname = [
+            "libcrypto.44.dylib",
+            "libcrypto.42.dylib",
+            "libcrypto.41.dylib",
+            "libcrypto.35.dylib",
+            "libcrypto.dylib",
+        ];
+    } else
+    version(linux) {
+        enum loadFunction = "dlopen(lib.ptr, RTLD_LAZY)";
+        immutable string[] libsslname = [
+            "libssl.so.3",
+            "libssl.so.1.1",
+            "libssl.so.1.0.2",
+            "libssl.so.1.0.1",
+            "libssl.so.1.0.0",
+            "libssl.so",
+        ];
+        immutable string[] libcryptoname = [
+            "libcrypto.so.3",
+            "libcrypto.so.1.1",
+            "libcrypto.so.1.0.2",
+            "libcrypto.so.1.0.1",
+            "libcrypto.so.1.0.0",
+            "libcrypto.so",
+        ];
+    } else
+    version(FreeBSD) {
+        enum loadFunction = "dlopen(lib.ptr, RTLD_LAZY)";
+        immutable string[] libsslname = [
+            "libssl.so.1.1",
+            "libssl.so.1.0.2",
+            "libssl.so.1.0.1",
+            "libssl.so.1.0.0",
+            "libssl.so",
+        ];
+        immutable string[] libcryptoname = [
+            "libcrypto.so.1.1",
+            "libcrypto.so.1.0.2",
+            "libcrypto.so.1.0.1",
+            "libcrypto.so.1.0.0",
+            "libcrypto.so",
+        ];
+    } else
+    version(Windows) {
+        enum loadFunction = "LoadLibrary(lib.ptr)";
         
-    //     immutable wstring[] libsslname = [
-    //          "libssl32.dll"w,
-    //          "libssl-3"w,
-    //          "libssl-3-x64"w,
-    //      ];
-    //      immutable wstring[] libcryptoname = [
-    //          "libeay32.dll"w,
-    //          "libcrypto-3"w,
-    //          "libcrypto-3-x64"w,
-    //     ];
-    // } else {
-    //     debug(requests) trace("error loading openssl: unsupported system - first access over https will fail");
-    //     return;
-    // }
+        immutable wstring[] libsslname = [
+             "libssl32.dll"w,
+             "libssl-3"w,
+             "libssl-3-x64"w,
+         ];
+         immutable wstring[] libcryptoname = [
+             "libeay32.dll"w,
+             "libcrypto-3"w,
+             "libcrypto-3-x64"w,
+        ];
+    } else {
+        debug(requests) trace("error loading openssl: unsupported system - first access over https will fail");
+        return;
+    }
 
-    // static if ( enableSSL && is(typeof(loadFunction)) ) {
-    //     foreach(lib; libsslname) {
-    //         openssl._libssl = cast(typeof(openssl._libssl))mixin(loadFunction);
-    //         if ( openssl._libssl !is null ) {
-    //             debug(requests) tracef("will use %s".format(lib));
-    //             break;
-    //         }
-    //     }
-    //     foreach(lib; libcryptoname) {
-    //         openssl._libcrypto = cast(typeof(openssl._libcrypto))mixin(loadFunction);
-    //         if ( openssl._libcrypto !is null ) {
-    //             debug(requests) tracef("will use %s".format(lib));
-    //             break;
-    //         }
-    //     }
-    // }
+    static if ( enableSSL && is(typeof(loadFunction)) ) {
+        foreach(lib; libsslname) {
+            openssl._libssl = cast(typeof(openssl._libssl))mixin(loadFunction);
+            if ( openssl._libssl !is null ) {
+                debug(requests) tracef("will use %s".format(lib));
+                break;
+            }
+        }
+        foreach(lib; libcryptoname) {
+            openssl._libcrypto = cast(typeof(openssl._libcrypto))mixin(loadFunction);
+            if ( openssl._libcrypto !is null ) {
+                debug(requests) tracef("will use %s".format(lib));
+                break;
+            }
+        }
+    }
 
-    // if ( openssl._libssl is null ) {
-    //     debug(requests) trace("warning: failed to load libssl - first access over https will fail");
-    //     return;
-    // }
-    // if ( openssl._libcrypto is null ) {
-    //     debug(requests) trace("warning: failed to load libcrypto - first access over https will fail");
-    //     return;
-    // }
+    if ( openssl._libssl is null ) {
+        debug(requests) trace("warning: failed to load libssl - first access over https will fail");
+        return;
+    }
+    if ( openssl._libcrypto is null ) {
+        debug(requests) trace("warning: failed to load libcrypto - first access over https will fail");
+        return;
+    }
     openssl._ver = openssl.OpenSSL_version_detect();
 
     mixin(SSL_Function_set_i!("SSL_library_init", int));
