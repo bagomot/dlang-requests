@@ -118,11 +118,15 @@ shared static this() {
         enum loadFunction = "LoadLibrary(lib.ptr)";
         
         immutable wstring[] libsslname = [
-             "libssl32.dll"w,
              "libssl-3"w,
              "libssl-3-x64"w,
+             "libssl32.dll"w,
+             "libssl-1_1"w,
+             "libssl-1_1-x64"w,
          ];
          immutable wstring[] libcryptoname = [
+             "libcrypto-3"w,
+             "libcrypto-3-x64"w,
              "libeay32.dll"w,
              "libcrypto-3"w,
              "libcrypto-3-x64"w,
@@ -192,14 +196,22 @@ shared static this() {
     mixin(CRYPTO_Function_set_i!("ERR_get_error", c_ulong));
 
     void delegate()[Version] init_matrix;
-    init_matrix[Version(1,0)] = &openssl.init1_0;
-    init_matrix[Version(1,1)] = &openssl.init1_1;
-    init_matrix[Version(0,2)] = &openssl.init1_1; // libressl >= 2.7.1
-    init_matrix[Version(0,3)] = &openssl.init1_1; // libressl >= 3.0.0
-    init_matrix[Version(2,3)] = &openssl.init1_1; // libressl >= 3.2.0
-    auto init = init_matrix.get(openssl._ver, null);
-    if ( init is null ) {
-        throw new Exception("loading openssl: unknown version for init");
+    init_matrix[Version(1, 0)] = &openssl.init1_0;
+    init_matrix[Version(1, 1)] = &openssl.init1_1;
+    init_matrix[Version(2, 0)] = &openssl.init1_1;
+    init_matrix[Version(0, 2)] = &openssl.init1_1; // libressl >= 2.7.1
+    init_matrix[Version(0, 3)] = &openssl.init1_1; // libressl >= 3.0.0
+    init_matrix[Version(3, 0)] = &openssl.init1_1; // >=3.0
+    auto initVer = (ver) {
+        if (ver.major == 3 && ver.minor >= 1) // set 3.x to 3.0 for the init matrix
+            return Version(3, 0);
+        else
+            return ver;
+    }(openssl._ver);
+    auto init = init_matrix.get(initVer, null);
+    if (init is null)
+    {
+        throw new Exception("loading openssl: unknown version %s for init".format(openssl._ver));
     }
     init();
 }
