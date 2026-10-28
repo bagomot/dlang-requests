@@ -14,6 +14,10 @@ import deimos.openssl.evp;
 version(Windows) {
     import core.sys.windows.windows;
     alias DLSYM = GetProcAddress;
+    // Restricts the search, the DLL's own imports included, to the executable's directory and System32:
+    // the default order also covers the current directory and PATH.
+    enum DWORD LOAD_LIBRARY_SEARCH_APPLICATION_DIR = 0x00000200;
+    enum DWORD LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800;
 } else {
     alias DLSYM = dlsym;
 }
@@ -115,7 +119,7 @@ shared static this() {
         ];
     } else
     version(Windows) {
-        enum loadFunction = "LoadLibrary(lib.ptr)";
+        enum loadFunction = "LoadLibraryExW(lib.ptr, null, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)";
         
         immutable wstring[] libsslname = [
              "libssl-3"w,
