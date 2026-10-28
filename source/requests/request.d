@@ -59,7 +59,7 @@ $(TABLE
  $(TR
   $(TD proxy)
   $(TD `string`)
-  $(TD url of the HTTP/HTTPS/FTP proxy)
+  $(TD url of the HTTP proxy)
   $(TD `null`)
  )
  $(TR
@@ -121,7 +121,6 @@ $(TABLE
 */
 module requests.request;
 import requests.http;
-import requests.ftp;
 import requests.streams;
 import requests.base;
 import requests.uri;
@@ -419,17 +418,6 @@ public struct Request {
         _headers = null;
         _userHeaders = _UH.init;
     }
-    /// Execute GET for http and retrieve file for FTP.
-    /// You have to provide at least $(B uri). All other arguments should conform to HTTPRequest.get or FTPRequest.get depending on the URI scheme.
-    /// When arguments do not conform scheme (for example you try to call get("ftp://somehost.net/pub/README", {"a":"b"}) which doesn't make sense)
-    /// you will receive Exception("Operation not supported for ftp")
-    ///
-
-    /// Execute POST for http and STOR file for FTP.
-    /// You have to provide  $(B uri) and data. Data should conform to HTTPRequest.post or FTPRequest.post depending on the URI scheme.
-    /// When arguments do not conform scheme you will receive Exception("Operation not supported for ftp")
-    ///
-
     Response exec(string method="GET", A...)(string url, A args)
     {
         return execute(method, url, args);
@@ -497,9 +485,6 @@ public struct Request {
         {
             switch (r._uri.scheme)
             {
-                case "ftp":
-                    FTPRequest ftp;
-                    return ftp.execute(r);
                 case "https","http":
                     HTTPRequest http;
                     return http.execute(r);

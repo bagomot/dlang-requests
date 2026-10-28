@@ -12,12 +12,10 @@ HTTP client library, inspired by python-requests with goals:
 module requests;
 
 public import requests.http;
-public import requests.ftp;
 public import requests.streams;
 public import requests.base;
 public import requests.uri;
 public import requests.request;
-public import requests.pool;
 public import requests.utils;
 public import requests.rangeadapter;
 

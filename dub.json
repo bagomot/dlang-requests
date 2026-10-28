@@ -1,6 +1,6 @@
 {
     "name": "requests",
-    "description": "http/ftp client library, inspired by python-requests",
+    "description": "HTTP client library, inspired by python-requests",
     "copyright": "Copyright © 2016, igor",
     "authors": ["ikod"],
     "license": "BSL-1.0",
