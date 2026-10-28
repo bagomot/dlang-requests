@@ -1,7 +1,9 @@
-.dub
-docs.json
-__dummy.html
+.dub/
+dub.selections.json
 *.o
 *.obj
-request.dproj
-dub.selections.json
+/*.a
+/*.lib
+/*.exe
+/*.pdb
+/requests-test-*
