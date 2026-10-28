@@ -171,6 +171,7 @@ alias NetStreamFactory = NetworkStream delegate(string, string, ushort);
 interface Interceptor {
     Response opCall(Request r, RequestHandler next);
 }
+/// Runs the rest of an interceptor chain; calling `handle` again runs that rest again.
 class RequestHandler {
     private Interceptor[] _interceptors;
     this(Interceptor[] i)
@@ -179,9 +180,7 @@ class RequestHandler {
     }
     Response handle(Request r)
     {
-        auto i = _interceptors.front();
-        _interceptors.popFront();
-        return i(r, this);
+        return _interceptors.front()(r, new RequestHandler(_interceptors[1 .. $]));
     }
 }
 
