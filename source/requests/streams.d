@@ -17,8 +17,9 @@ import std.datetime;
 import std.socket;
 import core.stdc.errno;
 import core.stdc.string;
+import core.stdc.config : c_long;
 
-import requests.ssl_adapter : openssl, SSL, SSL_CTX;
+import requests.ssl_adapter : openssl, SSL, SSL_CTX, X509_V_OK, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS;
 
 alias InDataHandler = DataPipeIface!ubyte;
 
@@ -841,19 +842,51 @@ else {
         ];
     }
 
+    /// Whether `host` is an IPv4 or IPv6 address literal rather than a DNS name.
+    package bool isIpLiteral(string host) pure @safe {
+        import std.ascii : isDigit;
+        if ( host.canFind(':') ) {
+            return true;
+        }
+        auto parts = host.split('.');
+        return parts.length == 4 && parts.all!(p => p.length > 0 && p.length <= 3 && p.all!isDigit && p.to!uint <= 255);
+    }
+
+    unittest {
+        assert(isIpLiteral("127.0.0.1"));
+        assert(isIpLiteral("::1"));
+        assert(!isIpLiteral("localhost"));
+        assert(!isIpLiteral("1.2.3"));
+        assert(!isIpLiteral("1.2.3.256"));
+        assert(!isIpLiteral("1.2.3.4.test"));
+    }
+
     public class OpenSslSocket : Socket {
         //enum SSL_MODE_RELEASE_BUFFERS = 0x00000010L;
         private SSL* ssl;
         private SSL_CTX* ctx;
+        private bool verifyPeer;
+        private bool peerNameSet;
+        private bool ownsHandle = true;
 
         private void initSsl(SSLOptions opts) {
             //ctx = SSL_CTX_new(SSLv3_client_method());
             ctx = openssl.SSL_CTX_new(openssl.TLS_method());
             assert(ctx !is null);
-            if ( opts.getVerifyPeer() ) {
-                openssl.SSL_CTX_set_default_verify_paths(ctx);
+            scope(failure) {
+                openssl.SSL_CTX_free(ctx);
+                ctx = null;
+            }
+            verifyPeer = opts.getVerifyPeer();
+            if ( verifyPeer ) {
                 if ( opts.getCaCert() ) {
-                    openssl.SSL_CTX_load_verify_locations(ctx, cast(char*)opts.getCaCert().toStringz(), cast(char*)null);
+                    // A given CA file is the only trust anchor: the default paths would add the store of
+                    // whichever OpenSSL build got loaded, and SSL_CERT_FILE/SSL_CERT_DIR.
+                    if ( openssl.SSL_CTX_load_verify_locations(ctx, cast(char*)opts.getCaCert().toStringz(), cast(char*)null) != 1 ) {
+                        throw new ConnectError("can't load CA certificates from %s: %s".format(opts.getCaCert(), sslErrorReason()));
+                    }
+                } else {
+                    openssl.SSL_CTX_set_default_verify_paths(ctx);
                 }
                 openssl.SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, null);
             }
@@ -883,17 +916,80 @@ else {
             openssl.SSL_set_fd(ssl, cast(int)this.handle);
         }
 
+        private static string sslErrorReason() {
+            return to!string(openssl.ERR_reason_error_string(openssl.ERR_get_error()));
+        }
+
+        /**
+         * Sets the name sent in SNI and, when the peer is verified, the name its certificate must carry:
+         * a DNS name, or an IP address matched against the certificate's IP entries.
+         */
+        void setPeerName(string host) {
+            immutable ip = isIpLiteral(host);
+            if ( verifyPeer ) {
+                if ( !openssl.hostVerificationAvailable() ) {
+                    throw new ConnectError("the loaded OpenSSL can't verify the host name in a certificate");
+                }
+                auto param = openssl.SSL_get0_param(ssl);
+                int rc;
+                if ( ip ) {
+                    rc = openssl.X509_VERIFY_PARAM_set1_ip_asc(param, host.toStringz());
+                } else {
+                    openssl.X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+                    rc = openssl.X509_VERIFY_PARAM_set1_host(param, host.toStringz(), 0);
+                }
+                if ( rc != 1 ) {
+                    throw new ConnectError("can't set the host name to verify: %s".format(sslErrorReason()));
+                }
+                peerNameSet = true;
+            }
+            // SNI carries host names only (RFC 6066).
+            if ( !ip ) {
+                openssl.SSL_set_tlsext_host_name(ssl, host.toStringz());
+            }
+        }
+
+        private void handshake() {
+            if ( verifyPeer && !peerNameSet ) {
+                throw new ConnectError("can't verify the peer without its host name");
+            }
+            immutable rc = openssl.SSL_connect(ssl);
+            if ( rc <= 0 ) {
+                throw new ConnectError("TLS handshake failed: %s".format(handshakeFailure(rc)));
+            }
+            if ( verifyPeer ) {
+                immutable v = openssl.SSL_get_verify_result(ssl);
+                if ( v != X509_V_OK ) {
+                    throw new ConnectError("TLS handshake failed: %s".format(verifyFailure(v)));
+                }
+            }
+        }
+
+        private string handshakeFailure(int rc) {
+            auto r = "SSL error %d, %s".format(openssl.SSL_get_error(ssl, rc), sslErrorReason());
+            if ( verifyPeer ) {
+                immutable v = openssl.SSL_get_verify_result(ssl);
+                if ( v != X509_V_OK ) {
+                    r ~= ", " ~ verifyFailure(v);
+                }
+            }
+            return r;
+        }
+
+        private static string verifyFailure(c_long v) {
+            auto text = openssl.X509_verify_cert_error_string(v);
+            return text is null
+                ? "certificate verification error %d".format(v)
+                : "certificate verification error %d (%s)".format(v, to!string(text));
+        }
+
         @trusted
         override void connect(Address dest) {
             super.connect(dest);
-            if(openssl.SSL_connect(ssl) == -1) {
-                throw new Exception("ssl connect failed: %s".format(to!string(openssl.ERR_reason_error_string(openssl.ERR_get_error()))));
-            }
+            handshake();
         }
         auto connectSSL() {
-            if(openssl.SSL_connect(ssl) == -1) {
-                throw new Exception("ssl connect failed: %s".format(to!string(openssl.ERR_reason_error_string(openssl.ERR_get_error()))));
-            }
+            handshake();
             debug(requests) tracef("ssl socket connected");
             return this;
         }
@@ -913,14 +1009,19 @@ else {
         }
         this(AddressFamily af, SocketType type = SocketType.STREAM, SSLOptions opts = SSLOptions()) {
             super(af, type);
+            scope(failure) close();
             initSsl(opts);
         }
-        this(socket_t sock, AddressFamily af, SSLOptions opts = SSLOptions()) {
+        /// `ownsHandle` false leaves closing `sock` to whoever opened it.
+        this(socket_t sock, AddressFamily af, SSLOptions opts = SSLOptions(), bool ownsHandle = true) {
             super(sock, af);
+            this.ownsHandle = ownsHandle;
             initSsl(opts);
         }
         override void close() scope {
-            super.close();
+            if ( ownsHandle ) {
+                super.close();
+            }
             if ( ssl !is null ) {
                 openssl.SSL_free(ssl);
                 ssl = null;
@@ -947,13 +1048,16 @@ else {
         this(NetworkStream ostream, SSLOptions opts, string host = null) {
             _sslOptions = opts;
             this.host = host;
+            // Left open, the tunnel would stay cached as a connection to the https origin.
+            scope(failure) ostream.close();
             auto osock = ostream.so();
             underlyingSocket = osock;
             osock.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
-            auto ss = new OpenSslSocket(osock.handle, osock.addressFamily, _sslOptions);
+            auto ss = new OpenSslSocket(osock.handle, osock.addressFamily, _sslOptions, false);
+            scope(failure) ss.close();
             ssl = ss.ssl;
             if ( host !is null ) {
-                openssl.SSL_set_tlsext_host_name(ssl, toStringz(host));
+                ss.setPeerName(host);
             }
             ss.connectSSL();
             __isOpen = true;
@@ -976,12 +1080,12 @@ else {
             auto ss = new OpenSslSocket(fa, SocketType.STREAM, _sslOptions);
             assert(ss !is null, "Can't create socket");
             ssl = ss.ssl;
-            if ( host !is null ) {
-                openssl.SSL_set_tlsext_host_name(ssl, toStringz(host));
-            }
             s = ss;
-            s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
             __isOpen = true;
+            if ( host !is null ) {
+                ss.setPeerName(host);
+            }
+            s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
         }
         override SocketStream connect(string h, ushort p, Duration timeout = 10.seconds) {
             host = h;
@@ -1119,6 +1223,9 @@ public abstract class SocketStream : NetworkStream {
             } catch (SocketException e) {
                 debug(requests) warningf("Failed to connect to %s:%d(%s): %s", host, port, a, e.msg);
                 s.close();
+            } catch (ConnectError e) {
+                close();
+                throw e;
             }
         }
         if ( !__isConnected ) {
