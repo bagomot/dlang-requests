@@ -7,7 +7,8 @@
     "sourcePaths": ["source"],
     "importPaths": ["source"],
     "dependencies": {
-        "cachetools": "~>0"
+        "automem": "==0.6.11",
+        "cachetools": "==1.0.1"
     },
     "configurations": [
         {
