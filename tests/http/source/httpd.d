@@ -1,4 +1,4 @@
-﻿module requests.server.httpd;
+module httpd;
 
 import std.algorithm;
 import std.array;

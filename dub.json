@@ -23,19 +23,12 @@
     "buildTypes": {
         "debug": {
             "buildOptions": ["debugMode", "debugInfo"],
-            "dflags-dmd": ["-debug=requests", "-debug=httpd", "-g"],
-            "dflags-ldc": ["-d-debug=requests"],
-            "versions": ["httpbin"]
+            "dflags-dmd": ["-debug=requests", "-g"],
+            "dflags-ldc": ["-d-debug=requests"]
         },
         "unittest": {
             "buildOptions": ["unittests", "debugMode", "debugInfo"],
-            "versions": ["httpbin"],
-            "debugVersions": ["requests", "httpd"]
-        },
-        "localtest": {
-            "buildOptions": ["unittests", "debugMode", "debugInfo"],
-            "versions": ["localtest"],
-            "sourcePaths": ["source", "tests"]
+            "debugVersions": ["requests"]
         }
     }
 }
