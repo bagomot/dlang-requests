@@ -1,0 +1,11 @@
+{
+	"name": "tls-tests",
+	"description": "TLS tests of requests against local servers, run with dub test",
+	"license": "BSL-1.0",
+	"targetType": "library",
+	"dependencies": {
+		"requests": {
+			"path": "../.."
+		}
+	}
+}
