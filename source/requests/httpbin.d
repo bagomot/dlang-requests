@@ -1,7 +1,5 @@
 module httpbin;
 
-version(vibeD) {
-} else
 version (httpbin)
 {
 	import requests.server.httpd;

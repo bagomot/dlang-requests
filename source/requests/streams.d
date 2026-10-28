@@ -849,315 +849,311 @@ extern (C) void keylog(SSL* s, const char* line) {
     f.flush();
 }
 
-version(vibeD) {
+extern(C) {
+    int SSL_library_init();
 }
-else {
-    extern(C) {
-        int SSL_library_init();
+
+enum SSL_VERIFY_PEER = 0x01;
+enum SSL_FILETYPE_PEM = 1;
+enum SSL_FILETYPE_ASN1 = 2;
+
+immutable int[SSLOptions.filetype] ft2ssl;
+
+shared static this() {
+    ft2ssl = [
+        SSLOptions.filetype.pem: SSL_FILETYPE_PEM,
+        SSLOptions.filetype.asn1: SSL_FILETYPE_ASN1,
+        SSLOptions.filetype.der: SSL_FILETYPE_ASN1
+    ];
+}
+
+/// Whether `host` is an IPv4 or IPv6 address literal rather than a DNS name.
+package bool isIpLiteral(string host) pure @safe {
+    import std.ascii : isDigit;
+    if ( host.canFind(':') ) {
+        return true;
+    }
+    auto parts = host.split('.');
+    return parts.length == 4 && parts.all!(p => p.length > 0 && p.length <= 3 && p.all!isDigit && p.to!uint <= 255);
+}
+
+unittest {
+    assert(isIpLiteral("127.0.0.1"));
+    assert(isIpLiteral("::1"));
+    assert(!isIpLiteral("localhost"));
+    assert(!isIpLiteral("1.2.3"));
+    assert(!isIpLiteral("1.2.3.256"));
+    assert(!isIpLiteral("1.2.3.4.test"));
+}
+
+public class OpenSslSocket : Socket {
+    //enum SSL_MODE_RELEASE_BUFFERS = 0x00000010L;
+    private SSL* ssl;
+    private SSL_CTX* ctx;
+    private bool verifyPeer;
+    private bool peerNameSet;
+    private bool ownsHandle = true;
+
+    private void initSsl(SSLOptions opts) {
+        //ctx = SSL_CTX_new(SSLv3_client_method());
+        ctx = openssl.SSL_CTX_new(openssl.TLS_method());
+        assert(ctx !is null);
+        scope(failure) {
+            openssl.SSL_CTX_free(ctx);
+            ctx = null;
+        }
+        verifyPeer = opts.getVerifyPeer();
+        if ( verifyPeer ) {
+            if ( opts.getCaCert() ) {
+                // A given CA file is the only trust anchor: the default paths would add the store of
+                // whichever OpenSSL build got loaded, and SSL_CERT_FILE/SSL_CERT_DIR.
+                if ( openssl.SSL_CTX_load_verify_locations(ctx, cast(char*)opts.getCaCert().toStringz(), cast(char*)null) != 1 ) {
+                    throw new ConnectError("can't load CA certificates from %s: %s".format(opts.getCaCert(), sslErrorReason()));
+                }
+            } else {
+                openssl.SSL_CTX_set_default_verify_paths(ctx);
+            }
+            openssl.SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, null);
+        }
+        immutable keyFile = opts.getKeyFile();
+        immutable keyType = opts.getKeyType();
+        immutable certFile = opts.getCertFile();
+        immutable certType = opts.getCertType();
+        final switch(opts.haveFiles()) {
+            case 0b11:  // both files
+                openssl.SSL_CTX_use_PrivateKey_file(ctx,  keyFile.toStringz(), ft2ssl[keyType]);
+                openssl.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(),ft2ssl[certType]);
+                break;
+            case 0b01:  // key only
+                openssl.SSL_CTX_use_PrivateKey_file(ctx,  keyFile.toStringz(), ft2ssl[keyType]);
+                openssl.SSL_CTX_use_certificate_file(ctx, keyFile.toStringz(), ft2ssl[keyType]);
+                break;
+            case 0b10:  // cert only
+                openssl.SSL_CTX_use_PrivateKey_file(ctx,  certFile.toStringz(), ft2ssl[certType]);
+                openssl.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(), ft2ssl[certType]);
+                break;
+            case 0b00:
+                break;
+        }
+        if ( opts.useKeyLogFile() ) {
+            init_keylog_file();
+            openssl.SSL_CTX_set_keylog_callback(ctx, &keylog);
+        }
+        //SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
+        //SSL_CTX_ctrl(ctx, 33, SSL_MODE_RELEASE_BUFFERS, null);
+        ssl = openssl.SSL_new(ctx);
+        openssl.SSL_set_fd(ssl, cast(int)this.handle);
     }
 
-    enum SSL_VERIFY_PEER = 0x01;
-    enum SSL_FILETYPE_PEM = 1;
-    enum SSL_FILETYPE_ASN1 = 2;
-
-    immutable int[SSLOptions.filetype] ft2ssl;
-
-    shared static this() {
-        ft2ssl = [
-            SSLOptions.filetype.pem: SSL_FILETYPE_PEM,
-            SSLOptions.filetype.asn1: SSL_FILETYPE_ASN1,
-            SSLOptions.filetype.der: SSL_FILETYPE_ASN1
-        ];
+    private static string sslErrorReason() {
+        return to!string(openssl.ERR_reason_error_string(openssl.ERR_get_error()));
     }
 
-    /// Whether `host` is an IPv4 or IPv6 address literal rather than a DNS name.
-    package bool isIpLiteral(string host) pure @safe {
-        import std.ascii : isDigit;
-        if ( host.canFind(':') ) {
-            return true;
-        }
-        auto parts = host.split('.');
-        return parts.length == 4 && parts.all!(p => p.length > 0 && p.length <= 3 && p.all!isDigit && p.to!uint <= 255);
-    }
-
-    unittest {
-        assert(isIpLiteral("127.0.0.1"));
-        assert(isIpLiteral("::1"));
-        assert(!isIpLiteral("localhost"));
-        assert(!isIpLiteral("1.2.3"));
-        assert(!isIpLiteral("1.2.3.256"));
-        assert(!isIpLiteral("1.2.3.4.test"));
-    }
-
-    public class OpenSslSocket : Socket {
-        //enum SSL_MODE_RELEASE_BUFFERS = 0x00000010L;
-        private SSL* ssl;
-        private SSL_CTX* ctx;
-        private bool verifyPeer;
-        private bool peerNameSet;
-        private bool ownsHandle = true;
-
-        private void initSsl(SSLOptions opts) {
-            //ctx = SSL_CTX_new(SSLv3_client_method());
-            ctx = openssl.SSL_CTX_new(openssl.TLS_method());
-            assert(ctx !is null);
-            scope(failure) {
-                openssl.SSL_CTX_free(ctx);
-                ctx = null;
+    /**
+     * Sets the name sent in SNI and, when the peer is verified, the name its certificate must carry:
+     * a DNS name, or an IP address matched against the certificate's IP entries.
+     */
+    void setPeerName(string host) {
+        immutable ip = isIpLiteral(host);
+        if ( verifyPeer ) {
+            if ( !openssl.hostVerificationAvailable() ) {
+                throw new ConnectError("the loaded OpenSSL can't verify the host name in a certificate");
             }
-            verifyPeer = opts.getVerifyPeer();
-            if ( verifyPeer ) {
-                if ( opts.getCaCert() ) {
-                    // A given CA file is the only trust anchor: the default paths would add the store of
-                    // whichever OpenSSL build got loaded, and SSL_CERT_FILE/SSL_CERT_DIR.
-                    if ( openssl.SSL_CTX_load_verify_locations(ctx, cast(char*)opts.getCaCert().toStringz(), cast(char*)null) != 1 ) {
-                        throw new ConnectError("can't load CA certificates from %s: %s".format(opts.getCaCert(), sslErrorReason()));
-                    }
-                } else {
-                    openssl.SSL_CTX_set_default_verify_paths(ctx);
-                }
-                openssl.SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, null);
+            auto param = openssl.SSL_get0_param(ssl);
+            int rc;
+            if ( ip ) {
+                rc = openssl.X509_VERIFY_PARAM_set1_ip_asc(param, host.toStringz());
+            } else {
+                openssl.X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+                rc = openssl.X509_VERIFY_PARAM_set1_host(param, host.toStringz(), 0);
             }
-            immutable keyFile = opts.getKeyFile();
-            immutable keyType = opts.getKeyType();
-            immutable certFile = opts.getCertFile();
-            immutable certType = opts.getCertType();
-            final switch(opts.haveFiles()) {
-                case 0b11:  // both files
-                    openssl.SSL_CTX_use_PrivateKey_file(ctx,  keyFile.toStringz(), ft2ssl[keyType]);
-                    openssl.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(),ft2ssl[certType]);
-                    break;
-                case 0b01:  // key only
-                    openssl.SSL_CTX_use_PrivateKey_file(ctx,  keyFile.toStringz(), ft2ssl[keyType]);
-                    openssl.SSL_CTX_use_certificate_file(ctx, keyFile.toStringz(), ft2ssl[keyType]);
-                    break;
-                case 0b10:  // cert only
-                    openssl.SSL_CTX_use_PrivateKey_file(ctx,  certFile.toStringz(), ft2ssl[certType]);
-                    openssl.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(), ft2ssl[certType]);
-                    break;
-                case 0b00:
-                    break;
+            if ( rc != 1 ) {
+                throw new ConnectError("can't set the host name to verify: %s".format(sslErrorReason()));
             }
-            if ( opts.useKeyLogFile() ) {
-                init_keylog_file();
-                openssl.SSL_CTX_set_keylog_callback(ctx, &keylog);
-            }
-            //SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
-            //SSL_CTX_ctrl(ctx, 33, SSL_MODE_RELEASE_BUFFERS, null);
-            ssl = openssl.SSL_new(ctx);
-            openssl.SSL_set_fd(ssl, cast(int)this.handle);
+            peerNameSet = true;
         }
-
-        private static string sslErrorReason() {
-            return to!string(openssl.ERR_reason_error_string(openssl.ERR_get_error()));
-        }
-
-        /**
-         * Sets the name sent in SNI and, when the peer is verified, the name its certificate must carry:
-         * a DNS name, or an IP address matched against the certificate's IP entries.
-         */
-        void setPeerName(string host) {
-            immutable ip = isIpLiteral(host);
-            if ( verifyPeer ) {
-                if ( !openssl.hostVerificationAvailable() ) {
-                    throw new ConnectError("the loaded OpenSSL can't verify the host name in a certificate");
-                }
-                auto param = openssl.SSL_get0_param(ssl);
-                int rc;
-                if ( ip ) {
-                    rc = openssl.X509_VERIFY_PARAM_set1_ip_asc(param, host.toStringz());
-                } else {
-                    openssl.X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-                    rc = openssl.X509_VERIFY_PARAM_set1_host(param, host.toStringz(), 0);
-                }
-                if ( rc != 1 ) {
-                    throw new ConnectError("can't set the host name to verify: %s".format(sslErrorReason()));
-                }
-                peerNameSet = true;
-            }
-            // SNI carries host names only (RFC 6066).
-            if ( !ip ) {
-                openssl.SSL_set_tlsext_host_name(ssl, host.toStringz());
-            }
-        }
-
-        private void handshake() {
-            if ( verifyPeer && !peerNameSet ) {
-                throw new ConnectError("can't verify the peer without its host name");
-            }
-            immutable rc = openssl.SSL_connect(ssl);
-            if ( rc <= 0 ) {
-                throw new ConnectError("TLS handshake failed: %s".format(handshakeFailure(rc)));
-            }
-            if ( verifyPeer ) {
-                immutable v = openssl.SSL_get_verify_result(ssl);
-                if ( v != X509_V_OK ) {
-                    throw new ConnectError("TLS handshake failed: %s".format(verifyFailure(v)));
-                }
-            }
-        }
-
-        private string handshakeFailure(int rc) {
-            auto r = "SSL error %d, %s".format(openssl.SSL_get_error(ssl, rc), sslErrorReason());
-            if ( verifyPeer ) {
-                immutable v = openssl.SSL_get_verify_result(ssl);
-                if ( v != X509_V_OK ) {
-                    r ~= ", " ~ verifyFailure(v);
-                }
-            }
-            return r;
-        }
-
-        private static string verifyFailure(c_long v) {
-            auto text = openssl.X509_verify_cert_error_string(v);
-            return text is null
-                ? "certificate verification error %d".format(v)
-                : "certificate verification error %d (%s)".format(v, to!string(text));
-        }
-
-        @trusted
-        override void connect(Address dest) {
-            super.connect(dest);
-            handshake();
-        }
-        auto connectSSL() {
-            handshake();
-            debug(requests) tracef("ssl socket connected");
-            return this;
-        }
-        @trusted
-        override ptrdiff_t send(scope const(void)[] buf, SocketFlags flags) scope {
-            return openssl.SSL_write(ssl, buf.ptr, cast(uint) buf.length);
-        }
-        override ptrdiff_t send(scope const(void)[] buf) scope {
-            return send(buf, SocketFlags.NONE);
-        }
-        @trusted
-        override ptrdiff_t receive(scope void[] buf, SocketFlags flags) scope {
-            return openssl.SSL_read(ssl, buf.ptr, cast(int)buf.length);
-        }
-        override ptrdiff_t receive(scope void[] buf) scope {
-            return receive(buf, SocketFlags.NONE);
-        }
-        this(AddressFamily af, SocketType type = SocketType.STREAM, SSLOptions opts = SSLOptions()) {
-            super(af, type);
-            scope(failure) close();
-            initSsl(opts);
-        }
-        /// `ownsHandle` false leaves closing `sock` to whoever opened it.
-        this(socket_t sock, AddressFamily af, SSLOptions opts = SSLOptions(), bool ownsHandle = true) {
-            super(sock, af);
-            this.ownsHandle = ownsHandle;
-            initSsl(opts);
-        }
-        override void close() scope {
-            if ( ownsHandle ) {
-                super.close();
-            }
-            if ( ssl !is null ) {
-                openssl.SSL_free(ssl);
-                ssl = null;
-            }
-            if ( ctx !is null ) {
-                openssl.SSL_CTX_free(ctx);
-                ctx = null;
-            }
-        }
-        void SSL_set_tlsext_host_name(string host) {
-
+        // SNI carries host names only (RFC 6066).
+        if ( !ip ) {
+            openssl.SSL_set_tlsext_host_name(ssl, host.toStringz());
         }
     }
 
-    public class SSLSocketStream: SocketStream {
-        private SSLOptions _sslOptions;
-        private Socket underlyingSocket;
-        private SSL* ssl;
-        private string host;
-
-        this(SSLOptions opts) {
-            _sslOptions = opts;
+    private void handshake() {
+        if ( verifyPeer && !peerNameSet ) {
+            throw new ConnectError("can't verify the peer without its host name");
         }
-        this(NetworkStream ostream, SSLOptions opts, string host = null) {
-            _sslOptions = opts;
-            this.host = host;
-            // Left open, the tunnel would stay cached as a connection to the https origin.
-            scope(failure) ostream.close();
-            auto osock = ostream.so();
-            underlyingSocket = osock;
-            osock.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
-            auto ss = new OpenSslSocket(osock.handle, osock.addressFamily, _sslOptions, false);
-            scope(failure) ss.close();
-            ssl = ss.ssl;
-            if ( host !is null ) {
-                ss.setPeerName(host);
+        immutable rc = openssl.SSL_connect(ssl);
+        if ( rc <= 0 ) {
+            throw new ConnectError("TLS handshake failed: %s".format(handshakeFailure(rc)));
+        }
+        if ( verifyPeer ) {
+            immutable v = openssl.SSL_get_verify_result(ssl);
+            if ( v != X509_V_OK ) {
+                throw new ConnectError("TLS handshake failed: %s".format(verifyFailure(v)));
             }
-            ss.connectSSL();
-            __isOpen = true;
-            __isConnected = true;
-            s = ss;
-            debug(requests) tracef("ssl stream created from another stream: %s", s);
         }
-        override void close() {
-            ssl = null;
-            host = null;
+    }
+
+    private string handshakeFailure(int rc) {
+        auto r = "SSL error %d, %s".format(openssl.SSL_get_error(ssl, rc), sslErrorReason());
+        if ( verifyPeer ) {
+            immutable v = openssl.SSL_get_verify_result(ssl);
+            if ( v != X509_V_OK ) {
+                r ~= ", " ~ verifyFailure(v);
+            }
+        }
+        return r;
+    }
+
+    private static string verifyFailure(c_long v) {
+        auto text = openssl.X509_verify_cert_error_string(v);
+        return text is null
+            ? "certificate verification error %d".format(v)
+            : "certificate verification error %d (%s)".format(v, to!string(text));
+    }
+
+    @trusted
+    override void connect(Address dest) {
+        super.connect(dest);
+        handshake();
+    }
+    auto connectSSL() {
+        handshake();
+        debug(requests) tracef("ssl socket connected");
+        return this;
+    }
+    @trusted
+    override ptrdiff_t send(scope const(void)[] buf, SocketFlags flags) scope {
+        return openssl.SSL_write(ssl, buf.ptr, cast(uint) buf.length);
+    }
+    override ptrdiff_t send(scope const(void)[] buf) scope {
+        return send(buf, SocketFlags.NONE);
+    }
+    @trusted
+    override ptrdiff_t receive(scope void[] buf, SocketFlags flags) scope {
+        return openssl.SSL_read(ssl, buf.ptr, cast(int)buf.length);
+    }
+    override ptrdiff_t receive(scope void[] buf) scope {
+        return receive(buf, SocketFlags.NONE);
+    }
+    this(AddressFamily af, SocketType type = SocketType.STREAM, SSLOptions opts = SSLOptions()) {
+        super(af, type);
+        scope(failure) close();
+        initSsl(opts);
+    }
+    /// `ownsHandle` false leaves closing `sock` to whoever opened it.
+    this(socket_t sock, AddressFamily af, SSLOptions opts = SSLOptions(), bool ownsHandle = true) {
+        super(sock, af);
+        this.ownsHandle = ownsHandle;
+        initSsl(opts);
+    }
+    override void close() scope {
+        if ( ownsHandle ) {
             super.close();
-            if ( underlyingSocket ) {
-                underlyingSocket.close();
-            }
         }
-        override void open(AddressFamily fa) {
-            if ( s !is null ) {
-                s.close();
-            }
-            auto ss = new OpenSslSocket(fa, SocketType.STREAM, _sslOptions);
-            assert(ss !is null, "Can't create socket");
-            ssl = ss.ssl;
-            s = ss;
-            __isOpen = true;
-            if ( host !is null ) {
-                ss.setPeerName(host);
-            }
-            s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
+        if ( ssl !is null ) {
+            openssl.SSL_free(ssl);
+            ssl = null;
         }
-        override SocketStream connect(string h, ushort p, Duration timeout = 10.seconds) {
-            host = h;
-            return super.connect(h, p, timeout);
-        }
-        override SSLSocketStream accept() {
-            auto newso = s.accept();
-            if ( s is null ) {
-                return null;
-            }
-            auto newstream = new SSLSocketStream(_sslOptions);
-            auto sslSocket = new OpenSslSocket(newso.handle, s.addressFamily);
-            newstream.s = sslSocket;
-            newstream.__isOpen = true;
-            newstream.__isConnected = true;
-            return newstream;
+        if ( ctx !is null ) {
+            openssl.SSL_CTX_free(ctx);
+            ctx = null;
         }
     }
-    public class TCPSocketStream : SocketStream {
-        override void open(AddressFamily fa) {
-            if ( s !is null ) {
-                s.close();
-            }
-            s = new Socket(fa, SocketType.STREAM, ProtocolType.TCP);
-            assert(s !is null, "Can't create socket");
-            __isOpen = true;
-            s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
+    void SSL_set_tlsext_host_name(string host) {
+
+    }
+}
+
+public class SSLSocketStream: SocketStream {
+    private SSLOptions _sslOptions;
+    private Socket underlyingSocket;
+    private SSL* ssl;
+    private string host;
+
+    this(SSLOptions opts) {
+        _sslOptions = opts;
+    }
+    this(NetworkStream ostream, SSLOptions opts, string host = null) {
+        _sslOptions = opts;
+        this.host = host;
+        // Left open, the tunnel would stay cached as a connection to the https origin.
+        scope(failure) ostream.close();
+        auto osock = ostream.so();
+        underlyingSocket = osock;
+        osock.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
+        auto ss = new OpenSslSocket(osock.handle, osock.addressFamily, _sslOptions, false);
+        scope(failure) ss.close();
+        ssl = ss.ssl;
+        if ( host !is null ) {
+            ss.setPeerName(host);
         }
-        override TCPSocketStream accept() {
-            auto newso = s.accept();
-            if ( s is null ) {
-                return null;
-            }
-            auto newstream = new TCPSocketStream();
-            newstream.s = newso;
-            newstream.__isOpen = true;
-            newstream.__isConnected = true;
-            newstream.s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
-            return newstream;
+        ss.connectSSL();
+        __isOpen = true;
+        __isConnected = true;
+        s = ss;
+        debug(requests) tracef("ssl stream created from another stream: %s", s);
+    }
+    override void close() {
+        ssl = null;
+        host = null;
+        super.close();
+        if ( underlyingSocket ) {
+            underlyingSocket.close();
         }
+    }
+    override void open(AddressFamily fa) {
+        if ( s !is null ) {
+            s.close();
+        }
+        auto ss = new OpenSslSocket(fa, SocketType.STREAM, _sslOptions);
+        assert(ss !is null, "Can't create socket");
+        ssl = ss.ssl;
+        s = ss;
+        __isOpen = true;
+        if ( host !is null ) {
+            ss.setPeerName(host);
+        }
+        s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
+    }
+    override SocketStream connect(string h, ushort p, Duration timeout = 10.seconds) {
+        host = h;
+        return super.connect(h, p, timeout);
+    }
+    override SSLSocketStream accept() {
+        auto newso = s.accept();
+        if ( s is null ) {
+            return null;
+        }
+        auto newstream = new SSLSocketStream(_sslOptions);
+        auto sslSocket = new OpenSslSocket(newso.handle, s.addressFamily);
+        newstream.s = sslSocket;
+        newstream.__isOpen = true;
+        newstream.__isConnected = true;
+        return newstream;
+    }
+}
+public class TCPSocketStream : SocketStream {
+    override void open(AddressFamily fa) {
+        if ( s !is null ) {
+            s.close();
+        }
+        s = new Socket(fa, SocketType.STREAM, ProtocolType.TCP);
+        assert(s !is null, "Can't create socket");
+        __isOpen = true;
+        s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
+    }
+    override TCPSocketStream accept() {
+        auto newso = s.accept();
+        if ( s is null ) {
+            return null;
+        }
+        auto newstream = new TCPSocketStream();
+        newstream.s = newso;
+        newstream.__isOpen = true;
+        newstream.__isConnected = true;
+        newstream.s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
+        return newstream;
     }
 }
 
@@ -1180,11 +1176,7 @@ public interface NetworkStream {
     void bind(string);
     void bind(Address);
     void listen(int);
-    version(vibeD) {
-        TCPConnection so();
-    } else {
-        Socket so();
-    }
+    Socket so();
     ///
     /// Set timeout for receive calls. 0 means no timeout.
     ///
@@ -1333,213 +1325,5 @@ public abstract class SocketStream : NetworkStream {
     };
 }
 
-version (vibeD) {
-    import vibe.core.net, vibe.stream.tls;
-
-    public class TCPVibeStream : NetworkStream {
-    private:
-        TCPConnection _conn;
-        Duration _readTimeout = Duration.max;
-        bool _isOpen = true;
-        string _bind;
-
-    public:
-        @property bool isConnected() const {
-            return _conn.connected;
-        }
-        @property override bool isOpen() const {
-            return _conn && _isOpen;
-        }
-        void close() @trusted {
-            _conn.close();
-            _isOpen = false;
-        }
-        override TCPConnection so() {
-            return _conn;
-        }
-        override void bind(string to) {
-                _bind = to;
-        }
-        NetworkStream connect(string host, ushort port, Duration timeout = 10.seconds) {
-            // FIXME: timeout not supported in vibe.d
-            try {
-                _conn = connectTCP(host, port, _bind);
-            }
-            catch (Exception e)
-                throw new ConnectError("Can't connect to %s:%d".format(host, port), __FILE__, __LINE__, e);
-
-            return this;
-        }
-
-        ptrdiff_t send(const(void)[] buff) {
-            _conn.write(cast(const(ubyte)[])buff);
-            return buff.length;
-        }
-
-        ptrdiff_t receive(void[] buff) {
-            if (!_conn.waitForData(_readTimeout)) {
-                if (!_conn.connected || _conn.empty ) {
-                    return 0;
-                }
-                throw new TimeoutException("Timeout receiving data");
-            }
-
-            if(_conn.empty) {
-                return 0;
-            }
-
-            auto chunk = min(_conn.leastSize, buff.length);
-            assert(chunk != 0);
-            _conn.read(cast(ubyte[])buff[0 .. chunk]);
-            return chunk;
-        }
-
-        @property void readTimeout(Duration timeout) {
-            if (timeout == 0.seconds) {
-                _readTimeout = Duration.max;
-            }
-            else {
-                _readTimeout = timeout;
-            }
-        }
-        override TCPVibeStream accept() {
-            assert(false, "Must be implemented");
-        }
-        override @property void reuseAddr(bool){
-            assert(false, "Not Implemented");
-        }
-        override void bind(Address){
-            assert(false, "Not Implemented");
-        }
-        override void listen(int){
-            assert(false, "Not Implemented");
-        }
-    }
-
-    public class SSLVibeStream : TCPVibeStream {
-    private:
-        TLSStream _sslStream;
-        bool   _isOpen = true;
-        SSLOptions _sslOptions;
-        TCPConnection underlyingConnection;
-
-        void connectSSL(string host) {
-            auto sslctx = createTLSContext(TLSContextKind.client);
-            if ( _sslOptions.getVerifyPeer() ) {
-                if ( _sslOptions.getCaCert() == null ) {
-                    throw new ConnectError("With vibe.d you have to call setCaCert() before verify server certificate.");
-                }
-                sslctx.useTrustedCertificateFile(_sslOptions.getCaCert());
-                sslctx.peerValidationMode = TLSPeerValidationMode.trustedCert;
-            } else {
-                sslctx.peerValidationMode = TLSPeerValidationMode.none;
-            }
-            immutable keyFile = _sslOptions.getKeyFile();
-            immutable certFile = _sslOptions.getCertFile();
-            final switch(_sslOptions.haveFiles()) {
-                case 0b11:  // both files
-                    sslctx.usePrivateKeyFile(keyFile);
-                    sslctx.useCertificateChainFile(certFile);
-                    break;
-                case 0b01:  // key only
-                    sslctx.usePrivateKeyFile(keyFile);
-                    sslctx.useCertificateChainFile(keyFile);
-                    break;
-                case 0b10:  // cert only
-                    sslctx.usePrivateKeyFile(certFile);
-                    sslctx.useCertificateChainFile(certFile);
-                    break;
-                case 0b00:
-                    break;
-            }
-            _sslStream = createTLSStream(_conn, sslctx, host);
-        }
-
-    public:
-        this(SSLOptions opts) {
-            _sslOptions = opts;
-        }
-        override TCPConnection so() {
-            return _conn;
-        }
-        this(NetworkStream ostream, SSLOptions opts, string host = null) {
-            _sslOptions = opts;
-            auto oconn = ostream.so();
-            underlyingConnection = oconn;
-            _conn = oconn;
-            connectSSL(host);
-        }
-        override NetworkStream connect(string host, ushort port, Duration timeout = 10.seconds) {
-            try {
-                _conn = connectTCP(host, port);
-                connectSSL(host);
-            }
-            catch (ConnectError e) {
-                throw e;
-            }
-            catch (Exception e) {
-                throw new ConnectError("Can't connect to %s:%d".format(host, port), __FILE__, __LINE__, e);
-            }
-
-            return this;
-        }
-
-        override ptrdiff_t send(const(void)[] buff) {
-            _sslStream.write(cast(const(ubyte)[])buff);
-            return buff.length;
-        }
-
-        override ptrdiff_t receive(void[] buff) {
-            if (!_sslStream.dataAvailableForRead) {
-                if (!_conn.waitForData(_readTimeout)) {
-                    if (!_conn.connected) {
-                        return 0;
-                    }
-                    throw new TimeoutException("Timeout receiving data");
-                }
-            }
-
-            if(_sslStream.empty) {
-                return 0;
-            }
-
-            auto chunk = min(_sslStream.leastSize, buff.length);
-            assert(chunk != 0);
-            _sslStream.read(cast(ubyte[])buff[0 .. chunk]);
-            return chunk;
-        }
-
-        override void close() @trusted {
-            if ( _sslStream )
-            {
-                _sslStream.finalize();
-            }
-            _conn.close();
-            _isOpen = false;
-        }
-        @property override bool isOpen() const {
-            return _conn && _isOpen;
-        }
-        override SSLVibeStream accept() {
-            assert(false, "Must be implemented");
-        }
-        override @property void reuseAddr(bool){
-            assert(false, "Not Implemented");
-        }
-        override void bind(Address){
-            assert(false, "Not Implemented");
-        }
-        override void listen(int){
-            assert(false, "Not Implemented");
-        }
-    }
-}
-
-version (vibeD) {
-    public alias TCPStream = TCPVibeStream;
-    public alias SSLStream = SSLVibeStream;
-}
-else {
-    public alias TCPStream = TCPSocketStream;
-    public alias SSLStream = SSLSocketStream;
-}
+public alias TCPStream = TCPSocketStream;
+public alias SSLStream = SSLSocketStream;

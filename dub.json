@@ -20,9 +20,6 @@
             "platforms": ["linux"]
         }
     ],
-    "subPackages": [
-        "./vibed/"
-    ],
     "buildTypes": {
         "debug": {
             "buildOptions": ["debugMode", "debugInfo"],

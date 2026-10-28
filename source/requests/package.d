@@ -39,15 +39,11 @@ package unittest {
     string httpbinUrl = httpTestServer();
     globalLogLevel(LogLevel.info);
 
-    version(vibeD) {
-    }
-    else {
-        import httpbin;
-        auto server = httpbinApp();
-        server.start();
-        scope(exit) {
-            server.stop();
-        }
+    import httpbin;
+    auto server = httpbinApp();
+    server.start();
+    scope(exit) {
+        server.stop();
     }
 
 

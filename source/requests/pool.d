@@ -436,49 +436,45 @@ Pool!R pool(R)(R r, uint w) {
 
 version(None) unittest {
 
-    version(vibeD) {
-        string httpbinurl = "http://httpbin.org";
-    } else {
-        info("Testing pool");
-        import httpbin;
-        auto server = httpbinApp();
-        server.start();
-        scope(exit) {
-            server.stop();
-        }
-        Thread.sleep(1.seconds);
-        globalLogLevel = LogLevel.trace;
-        string httpbinurl = "http://127.0.0.1:8081";
-        Job[] jobs = [
-            Job(httpbinurl ~ "/get").addHeaders([
-                                "X-Header": "X-Value",
-                                "Y-Header": "Y-Value"
-                            ]),
-            Job(httpbinurl ~ "/gzip"),
-            Job(httpbinurl ~ "/deflate"),
-            Job(httpbinurl ~ "/absolute-redirect/3")
-                    .maxRedirects(2),
-            Job(httpbinurl ~ "/range/1024"),
-            Job(httpbinurl ~ "/post")
-                    .method("POST")                     // change default GET to POST
-                    .data("test".representation())      // attach data for POST
-                    .opaque("id".representation),       // opaque data - you will receive the same in Result
-            Job(httpbinurl ~ "/delay/3")
-                    .timeout(1.seconds),                // set timeout to 1.seconds - this request will throw exception and fails
-            Job(httpbinurl ~ "/stream/1024"),
-        ];
-
-        auto count = jobs.
-            pool(6).
-            filter!(r => r.code==200).
-            count();
-
-        assert(count == jobs.length - 2, "pool test failed");
-        iota(20)
-            .map!(n => Job(httpbinurl ~ "/post")
-                            .data("%d".format(n).representation))
-            .pool(10)
-            .each!(r => assert(r.code==200));
-        info("Testing pool - done");
+    info("Testing pool");
+    import httpbin;
+    auto server = httpbinApp();
+    server.start();
+    scope(exit) {
+        server.stop();
     }
+    Thread.sleep(1.seconds);
+    globalLogLevel = LogLevel.trace;
+    string httpbinurl = "http://127.0.0.1:8081";
+    Job[] jobs = [
+        Job(httpbinurl ~ "/get").addHeaders([
+                            "X-Header": "X-Value",
+                            "Y-Header": "Y-Value"
+                        ]),
+        Job(httpbinurl ~ "/gzip"),
+        Job(httpbinurl ~ "/deflate"),
+        Job(httpbinurl ~ "/absolute-redirect/3")
+                .maxRedirects(2),
+        Job(httpbinurl ~ "/range/1024"),
+        Job(httpbinurl ~ "/post")
+                .method("POST")                     // change default GET to POST
+                .data("test".representation())      // attach data for POST
+                .opaque("id".representation),       // opaque data - you will receive the same in Result
+        Job(httpbinurl ~ "/delay/3")
+                .timeout(1.seconds),                // set timeout to 1.seconds - this request will throw exception and fails
+        Job(httpbinurl ~ "/stream/1024"),
+    ];
+
+    auto count = jobs.
+        pool(6).
+        filter!(r => r.code==200).
+        count();
+
+    assert(count == jobs.length - 2, "pool test failed");
+    iota(20)
+        .map!(n => Job(httpbinurl ~ "/post")
+                        .data("%d".format(n).representation))
+        .pool(10)
+        .each!(r => assert(r.code==200));
+    info("Testing pool - done");
 }
