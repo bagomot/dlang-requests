@@ -44,6 +44,10 @@ immutable int TLS1_2_VERSION = 0x0303;
 struct SSL {};
 struct SSL_CTX {};
 struct SSL_METHOD {};
+struct X509_VERIFY_PARAM {};
+
+enum c_long X509_V_OK = 0;
+enum uint X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS = 0x4;
 
 //
 // N  - function name, R - return type, A - args
@@ -197,8 +201,14 @@ shared static this() {
     mixin(SSL_Function_set_i!("SSL_CTX_free", void, SSL_CTX*));
     mixin(SSL_Function_set_i!("SSL_get_error", int, SSL*, int));
     mixin(SSL_Function_set_i!("SSL_ctrl", c_long, SSL*, int, c_long, void*));
+    mixin(SSL_Function_set_i!("SSL_get0_param", X509_VERIFY_PARAM*, SSL*));
+    mixin(SSL_Function_set_i!("SSL_get_verify_result", c_long, const(SSL)*));
     mixin(CRYPTO_Function_set_i!("ERR_reason_error_string", char*, c_ulong));
     mixin(CRYPTO_Function_set_i!("ERR_get_error", c_ulong));
+    mixin(CRYPTO_Function_set_i!("X509_VERIFY_PARAM_set1_host", int, X509_VERIFY_PARAM*, const(char)*, size_t));
+    mixin(CRYPTO_Function_set_i!("X509_VERIFY_PARAM_set_hostflags", void, X509_VERIFY_PARAM*, uint));
+    mixin(CRYPTO_Function_set_i!("X509_VERIFY_PARAM_set1_ip_asc", int, X509_VERIFY_PARAM*, const(char)*));
+    mixin(CRYPTO_Function_set_i!("X509_verify_cert_error_string", const(char)*, c_long));
 
     void delegate()[Version] init_matrix;
     init_matrix[Version(1,0)] = &openssl.init1_0;
@@ -260,8 +270,14 @@ struct OpenSSL {
         mixin(SSL_Function_decl!("SSL_CTX_free", void, SSL_CTX*));
         mixin(SSL_Function_decl!("SSL_get_error", int, SSL*, int));
         mixin(SSL_Function_decl!("SSL_ctrl", c_long, SSL*, int, c_long, void*));
+        mixin(SSL_Function_decl!("SSL_get0_param", X509_VERIFY_PARAM*, SSL*));
+        mixin(SSL_Function_decl!("SSL_get_verify_result", c_long, const(SSL)*));
         mixin(SSL_Function_decl!("ERR_reason_error_string", char*, c_ulong));
         mixin(SSL_Function_decl!("ERR_get_error", c_ulong));
+        mixin(SSL_Function_decl!("X509_VERIFY_PARAM_set1_host", int, X509_VERIFY_PARAM*, const(char)*, size_t));
+        mixin(SSL_Function_decl!("X509_VERIFY_PARAM_set_hostflags", void, X509_VERIFY_PARAM*, uint));
+        mixin(SSL_Function_decl!("X509_VERIFY_PARAM_set1_ip_asc", int, X509_VERIFY_PARAM*, const(char)*));
+        mixin(SSL_Function_decl!("X509_verify_cert_error_string", const(char)*, c_long));
     }
 
     Version reportVersion() const @nogc nothrow pure {
@@ -404,6 +420,36 @@ struct OpenSSL {
     }
     c_ulong ERR_get_error() const @nogc nothrow {
         return adapter_ERR_get_error();
+    }
+    /// Whether every function needed to verify the peer's host name was found.
+    bool hostVerificationAvailable() const @nogc nothrow {
+        return adapter_SSL_get0_param !is null
+            && adapter_SSL_get_verify_result !is null
+            && adapter_X509_VERIFY_PARAM_set1_host !is null
+            && adapter_X509_VERIFY_PARAM_set_hostflags !is null
+            && adapter_X509_VERIFY_PARAM_set1_ip_asc !is null;
+    }
+    X509_VERIFY_PARAM* SSL_get0_param(SSL* ssl) const @nogc nothrow {
+        return adapter_SSL_get0_param(ssl);
+    }
+    c_long SSL_get_verify_result(const(SSL)* ssl) const @nogc nothrow {
+        return adapter_SSL_get_verify_result(ssl);
+    }
+    int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM* param, const(char)* name, size_t namelen) const @nogc nothrow {
+        return adapter_X509_VERIFY_PARAM_set1_host(param, name, namelen);
+    }
+    void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM* param, uint flags) const @nogc nothrow {
+        adapter_X509_VERIFY_PARAM_set_hostflags(param, flags);
+    }
+    int X509_VERIFY_PARAM_set1_ip_asc(X509_VERIFY_PARAM* param, const(char)* ip) const @nogc nothrow {
+        return adapter_X509_VERIFY_PARAM_set1_ip_asc(param, ip);
+    }
+    /// Returns null when the function is missing.
+    const(char)* X509_verify_cert_error_string(c_long n) const @nogc nothrow {
+        if ( adapter_X509_verify_cert_error_string is null ) {
+            return null;
+        }
+        return adapter_X509_verify_cert_error_string(n);
     }
 }
 /*
