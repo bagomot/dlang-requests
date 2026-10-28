@@ -19,7 +19,7 @@ import core.stdc.errno;
 import core.stdc.string;
 import core.stdc.config : c_long;
 
-import requests.ssl_adapter : openssl, SSL, SSL_CTX, X509_V_OK, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS;
+import requests.ssl_adapter : openssl, OpenSSL, SSL, SSL_CTX, X509_V_OK, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS;
 
 alias InDataHandler = DataPipeIface!ubyte;
 
@@ -860,6 +860,7 @@ unittest {
 
 public class OpenSslSocket : Socket {
     //enum SSL_MODE_RELEASE_BUFFERS = 0x00000010L;
+    private const(OpenSSL)* api;
     private SSL* ssl;
     private SSL_CTX* ctx;
     private bool verifyPeer;
@@ -867,11 +868,13 @@ public class OpenSslSocket : Socket {
     private bool ownsHandle = true;
 
     private void initSsl(SSLOptions opts) {
-        //ctx = SSL_CTX_new(SSLv3_client_method());
-        ctx = openssl.SSL_CTX_new(openssl.TLS_method());
-        assert(ctx !is null);
+        api = &openssl();
+        ctx = api.SSL_CTX_new(api.TLS_client_method());
+        if ( ctx is null ) {
+            throw new ConnectError("can't create a TLS context: %s".format(sslErrorReason()));
+        }
         scope(failure) {
-            openssl.SSL_CTX_free(ctx);
+            api.SSL_CTX_free(ctx);
             ctx = null;
         }
         verifyPeer = opts.getVerifyPeer();
@@ -879,13 +882,13 @@ public class OpenSslSocket : Socket {
             if ( opts.getCaCert() ) {
                 // A given CA file is the only trust anchor: the default paths would add the store of
                 // whichever OpenSSL build got loaded, and SSL_CERT_FILE/SSL_CERT_DIR.
-                if ( openssl.SSL_CTX_load_verify_locations(ctx, cast(char*)opts.getCaCert().toStringz(), cast(char*)null) != 1 ) {
+                if ( api.SSL_CTX_load_verify_locations(ctx, opts.getCaCert().toStringz(), null) != 1 ) {
                     throw new ConnectError("can't load CA certificates from %s: %s".format(opts.getCaCert(), sslErrorReason()));
                 }
             } else {
-                openssl.SSL_CTX_set_default_verify_paths(ctx);
+                api.SSL_CTX_set_default_verify_paths(ctx);
             }
-            openssl.SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, null);
+            api.SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, null);
         }
         immutable keyFile = opts.getKeyFile();
         immutable keyType = opts.getKeyType();
@@ -893,28 +896,28 @@ public class OpenSslSocket : Socket {
         immutable certType = opts.getCertType();
         final switch(opts.haveFiles()) {
             case 0b11:  // both files
-                openssl.SSL_CTX_use_PrivateKey_file(ctx,  keyFile.toStringz(), ft2ssl[keyType]);
-                openssl.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(),ft2ssl[certType]);
+                api.SSL_CTX_use_PrivateKey_file(ctx,  keyFile.toStringz(), ft2ssl[keyType]);
+                api.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(),ft2ssl[certType]);
                 break;
             case 0b01:  // key only
-                openssl.SSL_CTX_use_PrivateKey_file(ctx,  keyFile.toStringz(), ft2ssl[keyType]);
-                openssl.SSL_CTX_use_certificate_file(ctx, keyFile.toStringz(), ft2ssl[keyType]);
+                api.SSL_CTX_use_PrivateKey_file(ctx,  keyFile.toStringz(), ft2ssl[keyType]);
+                api.SSL_CTX_use_certificate_file(ctx, keyFile.toStringz(), ft2ssl[keyType]);
                 break;
             case 0b10:  // cert only
-                openssl.SSL_CTX_use_PrivateKey_file(ctx,  certFile.toStringz(), ft2ssl[certType]);
-                openssl.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(), ft2ssl[certType]);
+                api.SSL_CTX_use_PrivateKey_file(ctx,  certFile.toStringz(), ft2ssl[certType]);
+                api.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(), ft2ssl[certType]);
                 break;
             case 0b00:
                 break;
         }
         //SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
         //SSL_CTX_ctrl(ctx, 33, SSL_MODE_RELEASE_BUFFERS, null);
-        ssl = openssl.SSL_new(ctx);
-        openssl.SSL_set_fd(ssl, cast(int)this.handle);
+        ssl = api.SSL_new(ctx);
+        api.SSL_set_fd(ssl, cast(int)this.handle);
     }
 
-    private static string sslErrorReason() {
-        return to!string(openssl.ERR_reason_error_string(openssl.ERR_get_error()));
+    private string sslErrorReason() {
+        return to!string(api.ERR_reason_error_string(api.ERR_get_error()));
     }
 
     /**
@@ -924,16 +927,13 @@ public class OpenSslSocket : Socket {
     void setPeerName(string host) {
         immutable ip = isIpLiteral(host);
         if ( verifyPeer ) {
-            if ( !openssl.hostVerificationAvailable() ) {
-                throw new ConnectError("the loaded OpenSSL can't verify the host name in a certificate");
-            }
-            auto param = openssl.SSL_get0_param(ssl);
+            auto param = api.SSL_get0_param(ssl);
             int rc;
             if ( ip ) {
-                rc = openssl.X509_VERIFY_PARAM_set1_ip_asc(param, host.toStringz());
+                rc = api.X509_VERIFY_PARAM_set1_ip_asc(param, host.toStringz());
             } else {
-                openssl.X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
-                rc = openssl.X509_VERIFY_PARAM_set1_host(param, host.toStringz(), 0);
+                api.X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+                rc = api.X509_VERIFY_PARAM_set1_host(param, host.toStringz(), 0);
             }
             if ( rc != 1 ) {
                 throw new ConnectError("can't set the host name to verify: %s".format(sslErrorReason()));
@@ -942,7 +942,7 @@ public class OpenSslSocket : Socket {
         }
         // SNI carries host names only (RFC 6066).
         if ( !ip ) {
-            openssl.SSL_set_tlsext_host_name(ssl, host.toStringz());
+            api.SSL_set_tlsext_host_name(ssl, host.toStringz());
         }
     }
 
@@ -950,12 +950,12 @@ public class OpenSslSocket : Socket {
         if ( verifyPeer && !peerNameSet ) {
             throw new ConnectError("can't verify the peer without its host name");
         }
-        immutable rc = openssl.SSL_connect(ssl);
+        immutable rc = api.SSL_connect(ssl);
         if ( rc <= 0 ) {
             throw new ConnectError("TLS handshake failed: %s".format(handshakeFailure(rc)));
         }
         if ( verifyPeer ) {
-            immutable v = openssl.SSL_get_verify_result(ssl);
+            immutable v = api.SSL_get_verify_result(ssl);
             if ( v != X509_V_OK ) {
                 throw new ConnectError("TLS handshake failed: %s".format(verifyFailure(v)));
             }
@@ -963,9 +963,9 @@ public class OpenSslSocket : Socket {
     }
 
     private string handshakeFailure(int rc) {
-        auto r = "SSL error %d, %s".format(openssl.SSL_get_error(ssl, rc), sslErrorReason());
+        auto r = "SSL error %d, %s".format(api.SSL_get_error(ssl, rc), sslErrorReason());
         if ( verifyPeer ) {
-            immutable v = openssl.SSL_get_verify_result(ssl);
+            immutable v = api.SSL_get_verify_result(ssl);
             if ( v != X509_V_OK ) {
                 r ~= ", " ~ verifyFailure(v);
             }
@@ -973,11 +973,8 @@ public class OpenSslSocket : Socket {
         return r;
     }
 
-    private static string verifyFailure(c_long v) {
-        auto text = openssl.X509_verify_cert_error_string(v);
-        return text is null
-            ? "certificate verification error %d".format(v)
-            : "certificate verification error %d (%s)".format(v, to!string(text));
+    private string verifyFailure(c_long v) {
+        return "certificate verification error %d (%s)".format(v, to!string(api.X509_verify_cert_error_string(v)));
     }
 
     @trusted
@@ -992,14 +989,14 @@ public class OpenSslSocket : Socket {
     }
     @trusted
     override ptrdiff_t send(scope const(void)[] buf, SocketFlags flags) scope {
-        return openssl.SSL_write(ssl, buf.ptr, cast(uint) buf.length);
+        return api.SSL_write(ssl, buf.ptr, cast(int)buf.length);
     }
     override ptrdiff_t send(scope const(void)[] buf) scope {
         return send(buf, SocketFlags.NONE);
     }
     @trusted
     override ptrdiff_t receive(scope void[] buf, SocketFlags flags) scope {
-        return openssl.SSL_read(ssl, buf.ptr, cast(int)buf.length);
+        return api.SSL_read(ssl, buf.ptr, cast(int)buf.length);
     }
     override ptrdiff_t receive(scope void[] buf) scope {
         return receive(buf, SocketFlags.NONE);
@@ -1015,16 +1012,16 @@ public class OpenSslSocket : Socket {
         this.ownsHandle = ownsHandle;
         initSsl(opts);
     }
-    override void close() scope {
+    override void close() scope @trusted {
         if ( ownsHandle ) {
             super.close();
         }
         if ( ssl !is null ) {
-            openssl.SSL_free(ssl);
+            api.SSL_free(ssl);
             ssl = null;
         }
         if ( ctx !is null ) {
-            openssl.SSL_CTX_free(ctx);
+            api.SSL_CTX_free(ctx);
             ctx = null;
         }
     }

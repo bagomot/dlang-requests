@@ -7,5 +7,24 @@
 		"requests": {
 			"path": "../.."
 		}
-	}
+	},
+	"configurations": [
+		{
+			"name": "openssl-dynamic",
+			"subConfigurations": {
+				"requests": "openssl-dynamic"
+			}
+		},
+		{
+			"name": "openssl-static",
+			"platforms": ["windows", "linux"],
+			"subConfigurations": {
+				"requests": "openssl-static"
+			},
+			"versions": ["RequestsOpenSSLStatic"],
+			"lflags-windows": ["/LIBPATH:$OPENSSL_LIB_DIR"],
+			"lflags-linux": ["-L$OPENSSL_LIB_DIR"],
+			"libs-linux": ["curl"]
+		}
+	]
 }

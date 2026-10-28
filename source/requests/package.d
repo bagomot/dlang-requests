@@ -18,6 +18,7 @@ public import requests.uri;
 public import requests.request;
 public import requests.utils;
 public import requests.rangeadapter;
+public import requests.ssl_adapter : OpenSSLUnavailableException;
 
 import std.datetime;
 import std.conv;

@@ -1,8 +1,8 @@
 /**
  * TLS peer verification against servers on the loopback interface, directly and through a CONNECT proxy.
  *
- * The certificates come from `../certs` (see `generate.sh` there). OpenSSL must be loadable by the test
- * executable: on Windows its DLLs go next to it.
+ * The certificates come from `../certs` (see `generate.sh` there). In the openssl-dynamic configuration
+ * OpenSSL must be loadable by the test executable: on Windows its DLLs go next to it.
  */
 module tls_tests;
 
@@ -15,13 +15,23 @@ import std.exception : collectException, enforce;
 import std.format : format;
 import std.path : buildPath, dirName;
 import std.socket;
-import std.string : indexOf, lastIndexOf, split, toStringz;
+import std.string : fromStringz, indexOf, lastIndexOf, split, toStringz;
 
 import requests;
+import requests.ssl_adapter : openssl;
 
 private string cert(string name) {
     return buildPath(__FILE_FULL_PATH__.dirName.dirName, "certs", name);
 }
+
+version (RequestsOpenSSLStatic) {
+    private enum linkage = "linked statically";
+} else {
+    private enum linkage = "loaded at run time";
+}
+
+/// The argument that makes the test executable run `probeWithoutOpenSSL` instead of the tests.
+private enum probeArgument = "--probe-without-openssl";
 
 // Runs each test on its own and names it, so one failure doesn't hide the rest.
 shared static this() {
@@ -30,6 +40,18 @@ shared static this() {
     Runtime.extendedModuleUnitTester = () {
         import std.stdio : writefln;
 
+        version (RequestsOpenSSLStatic) {
+        } else {
+            if (Runtime.args.canFind(probeArgument)) {
+                immutable passed = probeWithoutOpenSSL();
+                return UnitTestResult(1, passed ? 1 : 0, false, false);
+            }
+        }
+        try {
+            writefln("%s, %s", openssl.versionText, linkage);
+        } catch (OpenSSLUnavailableException e) {
+            writefln("OpenSSL is unavailable: %s", e.msg);
+        }
         UnitTestResult result;
         static foreach (test; __traits(getUnitTests, tls_tests)) {
             ++result.executed;
@@ -137,7 +159,7 @@ private final class PlainServer : LoopbackServer {
     }
 }
 
-/// Server-side OpenSSL functions, taken from the libssl that requests loaded.
+/// Server-side OpenSSL functions, from the OpenSSL that requests uses.
 private struct ServerSsl {
     extern (C) nothrow @nogc {
         void* function() TLS_server_method;
@@ -155,38 +177,66 @@ private struct ServerSsl {
     }
 }
 
-private ServerSsl loadServerSsl() {
-    void* lib;
-    version (Windows) {
-        import core.sys.windows.windows : GetModuleHandleW, GetProcAddress;
-
-        foreach (name; ["libssl-3-x64.dll"w, "libssl-3.dll"w, "libssl-1_1-x64.dll"w, "libssl-1_1.dll"w]) {
-            lib = GetModuleHandleW((name ~ '\0').ptr);
-            if (lib !is null) {
-                break;
-            }
-        }
-        alias symbol = (name) => cast(void*) GetProcAddress(lib, name.toStringz);
-    } else version (linux) {
-        import core.sys.linux.dlfcn : dlopen, dlsym, RTLD_NOLOAD, RTLD_NOW;
-
-        foreach (name; ["libssl.so.3", "libssl.so.1.1"]) {
-            lib = dlopen(name.toStringz, RTLD_NOW | RTLD_NOLOAD);
-            if (lib !is null) {
-                break;
-            }
-        }
-        alias symbol = (name) => dlsym(lib, name.toStringz);
-    } else {
-        static assert(false, "the TLS tests run on Windows and Linux");
+version (RequestsOpenSSLStatic) {
+    private extern (C) nothrow @nogc {
+        void* TLS_server_method();
+        void* SSL_CTX_new(void*);
+        int SSL_CTX_use_certificate_file(void*, const(char)*, int);
+        int SSL_CTX_use_PrivateKey_file(void*, const(char)*, int);
+        void SSL_CTX_free(void*);
+        void* SSL_new(void*);
+        int SSL_set_fd(void*, int);
+        int SSL_accept(void*);
+        int SSL_read(void*, void*, int);
+        int SSL_write(void*, const(void)*, int);
+        int SSL_shutdown(void*);
+        void SSL_free(void*);
     }
-    enforce(lib !is null, "requests has not loaded libssl; on Windows its DLLs belong next to the test executable");
-    ServerSsl s;
-    static foreach (m; __traits(allMembers, ServerSsl)) {
-        __traits(getMember, s, m) = cast(typeof(__traits(getMember, s, m))) symbol(m);
-        enforce(__traits(getMember, s, m) !is null, "libssl lacks " ~ m);
+
+    private ServerSsl loadServerSsl() {
+        ServerSsl s;
+        static foreach (m; __traits(allMembers, ServerSsl)) {
+            __traits(getMember, s, m) = mixin("&." ~ m);
+        }
+        return s;
     }
-    return s;
+} else {
+    private ServerSsl loadServerSsl() {
+        // Loads the library, so that the server takes the same one.
+        cast(void) openssl;
+        void* lib;
+        version (Windows) {
+            import core.sys.windows.windows : GetModuleHandleW, GetProcAddress;
+            import std.utf : toUTF16z;
+
+            foreach (major; [4, 3]) {
+                lib = GetModuleHandleW("libssl-%d-x64.dll".format(major).toUTF16z);
+                if (lib !is null) {
+                    break;
+                }
+            }
+            alias symbol = (name) => cast(void*) GetProcAddress(lib, name.toStringz);
+        } else version (linux) {
+            import core.sys.linux.dlfcn : dlopen, dlsym, RTLD_NOLOAD, RTLD_NOW;
+
+            foreach (major; [4, 3]) {
+                lib = dlopen("libssl.so.%d".format(major).toStringz, RTLD_NOW | RTLD_NOLOAD);
+                if (lib !is null) {
+                    break;
+                }
+            }
+            alias symbol = (name) => dlsym(lib, name.toStringz);
+        } else {
+            static assert(false, "the TLS tests run on Windows and Linux");
+        }
+        enforce(lib !is null, "requests has not loaded libssl; on Windows its DLLs belong next to the test executable");
+        ServerSsl s;
+        static foreach (m; __traits(allMembers, ServerSsl)) {
+            __traits(getMember, s, m) = cast(typeof(__traits(getMember, s, m))) symbol(m);
+            enforce(__traits(getMember, s, m) !is null, "libssl lacks " ~ m);
+        }
+        return s;
+    }
 }
 
 private __gshared ServerSsl serverSsl;
@@ -415,4 +465,145 @@ unittest {
     rq.addInterceptor(new Twice());
     assert(rq.get("http://127.0.0.1:%d/".format(server.port)).code == 200);
     assert(atomicLoad(server.served) == 2);
+}
+
+/// The OpenSSL libraries of major version 4 or 3 in the process.
+private string[] loadedOpenSSL() {
+    string[] loaded;
+    foreach (major; [4, 3]) {
+        version (Windows) {
+            import core.sys.windows.windows : GetModuleHandleW;
+            import std.utf : toUTF16z;
+
+            foreach (name; ["libssl-%d-x64.dll".format(major), "libcrypto-%d-x64.dll".format(major)]) {
+                if (GetModuleHandleW(name.toUTF16z) !is null) {
+                    loaded ~= name;
+                }
+            }
+        } else version (linux) {
+            import core.sys.linux.dlfcn : dlclose, dlopen, RTLD_NOLOAD, RTLD_NOW;
+
+            foreach (name; ["libssl.so.%d".format(major), "libcrypto.so.%d".format(major)]) {
+                if (auto library = dlopen(name.toStringz, RTLD_NOW | RTLD_NOLOAD)) {
+                    dlclose(library);
+                    loaded ~= name;
+                }
+            }
+        }
+    }
+    return loaded;
+}
+
+version (RequestsOpenSSLStatic) {
+} else {
+    /**
+     * Run from a process that can't load OpenSSL, by the test below on Windows: HTTP works, HTTPS throws, and
+     * no OpenSSL library gets loaded. Prints what it saw and returns whether it was all so.
+     */
+    private bool probeWithoutOpenSSL() {
+        import std.stdio : writefln;
+
+        auto server = new PlainServer();
+        scope (exit) server.stop();
+        bool passed = true;
+        void check(bool ok, string what) {
+            writefln("%s %s", ok ? "ok  " : "FAIL", what);
+            passed &= ok;
+        }
+
+        check(client().get("http://127.0.0.1:%d/".format(server.port)).code == 200, "an HTTP request succeeds");
+        foreach (attempt; 1 .. 3) {
+            auto e = collectException(client().get("https://127.0.0.1:%d/".format(server.port)));
+            check(cast(OpenSSLUnavailableException) e !is null,
+                "HTTPS request %d throws OpenSSLUnavailableException: %s".format(attempt,
+                    e is null ? "nothing thrown" : "%s: %s".format(typeid(e), e.msg)));
+        }
+        auto loaded = loadedOpenSSL();
+        check(loaded.length == 0, "no OpenSSL library is loaded: %-(%s, %)".format(loaded));
+        return passed;
+    }
+}
+
+version (RequestsOpenSSLStatic) {
+} else version (Windows)
+@("OpenSSL DLLs in the current directory or on PATH are not loaded, and without OpenSSL only HTTPS fails")
+unittest {
+    import std.file : copy, dirEntries, mkdirRecurse, rmdirRecurse, SpanMode, tempDir, thisExePath;
+    import std.path : baseName;
+    import std.process : environment, execute, thisProcessID, Config;
+
+    immutable root = buildPath(tempDir, "tls-tests-%d".format(thisProcessID));
+    immutable bare = buildPath(root, "bare"), decoy = buildPath(root, "decoy");
+    mkdirRecurse(bare);
+    mkdirRecurse(decoy);
+    scope (exit) rmdirRecurse(root);
+    immutable exe = buildPath(bare, thisExePath.baseName);
+    copy(thisExePath, exe);
+    size_t dlls;
+    foreach (dll; dirEntries(thisExePath.dirName, "lib*.dll", SpanMode.shallow)) {
+        copy(dll.name, buildPath(decoy, dll.name.baseName));
+        ++dlls;
+    }
+    enforce(dlls > 0, "no OpenSSL DLLs next to the test executable to put into the current directory and PATH");
+    auto r = execute([exe, probeArgument], ["PATH": decoy ~ ";" ~ environment["PATH"]],
+        Config.none, size_t.max, decoy);
+    enforce(r.status == 0, "the probe failed:
+" ~ r.output);
+    enforce(r.output.canFind("OpenSSL not found in the executable's directory or System32"), r.output);
+}
+
+version (RequestsOpenSSLStatic) version (Windows)
+@("the linked OpenSSL loads no OpenSSL DLL")
+unittest {
+    auto server = new TlsServer("localhost");
+    scope (exit) server.stop();
+    assert(client().get("https://localhost:%d/".format(server.port)).code == 200);
+    auto loaded = loadedOpenSSL();
+    assert(loaded.length == 0, "loaded: %-(%s, %)".format(loaded));
+}
+
+version (RequestsOpenSSLStatic) version (linux)
+@("the system libcurl and libssl in the same process keep to the system OpenSSL")
+unittest {
+    import core.sys.linux.dlfcn : dladdr, Dl_info, dlopen, dlsym, RTLD_DEFAULT, RTLD_NOLOAD, RTLD_NOW;
+    import etc.c.curl : curl_easy_cleanup, curl_easy_getinfo, curl_easy_init, curl_easy_perform, curl_easy_setopt,
+        curl_global_init, curl_version, CurlGlobal, CurlInfo, CurlOption;
+    import std.algorithm : endsWith;
+
+    // The test executable links libcurl, which brings the system libssl and libcrypto along.
+    enforce(dlopen("libssl.so.3", RTLD_NOW | RTLD_NOLOAD) !is null, "the system libssl is not loaded");
+    // Were the linked copy exported from the executable, the system libraries would bind to it.
+    foreach (name, library; ["SSL_CTX_new": "libssl.so.3", "SSL_free": "libssl.so.3",
+            "OPENSSL_LH_new": "libcrypto.so.3", "ERR_get_error": "libcrypto.so.3"]) {
+        Dl_info info;
+        enforce(dladdr(dlsym(RTLD_DEFAULT, name.toStringz), &info) != 0, name ~ " is not found");
+        enforce(info.dli_fname.fromStringz.endsWith(library),
+            "%s resolves to %s".format(name, info.dli_fname.fromStringz));
+    }
+
+    auto server = new TlsServer("localhost");
+    scope (exit) server.stop();
+    immutable url = "https://localhost:%d/".format(server.port);
+
+    static extern (C) size_t discard(char*, size_t size, size_t count, void*) {
+        return size * count;
+    }
+
+    enforce(curl_global_init(CurlGlobal.all) == 0);
+    auto curl = curl_easy_init();
+    scope (exit) curl_easy_cleanup(curl);
+    curl_easy_setopt(curl, CurlOption.url, url.toStringz);
+    curl_easy_setopt(curl, CurlOption.cainfo, cert("ca.pem").toStringz);
+    curl_easy_setopt(curl, CurlOption.writefunction, &discard);
+    immutable rc = curl_easy_perform(curl);
+    enforce(rc == 0, "libcurl failed with %d (%s)".format(rc, curl_version().fromStringz));
+    long code;
+    curl_easy_getinfo(curl, CurlInfo.response_code, &code);
+    enforce(code == 200, "libcurl got %d".format(code));
+
+    assert(client().get(url).code == 200);
+    // With the same version on both sides nothing here would tell the two copies apart.
+    immutable system = curl_version().fromStringz.idup;
+    enforce(!system.canFind(openssl.versionText.split(' ')[1]),
+        "libcurl (%s) and requests (%s) report the same OpenSSL version".format(system, openssl.versionText));
 }

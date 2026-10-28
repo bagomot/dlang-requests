@@ -1,499 +1,324 @@
+/**
+ * The OpenSSL functions requests calls, bound on the first TLS connection.
+ *
+ * By default libssl of major version 4 or 3 is loaded at run time, together with the libcrypto it links.
+ * With `version(RequestsOpenSSLStatic)` the functions are the ones linked into the executable.
+ */
 module requests.ssl_adapter;
 
-version(staticssl) {
-    public import requests.ssl_adapter_static;
-} else:
+import core.stdc.config : c_long, c_ulong;
+import std.algorithm : canFind;
+import std.concurrency : initOnce;
+import std.format : format;
+import std.string : fromStringz, toStringz;
+import std.sumtype : match, SumType;
 
-import std.stdio;
-import std.string;
-import std.format;
-import std.typecons;
-import core.stdc.stdlib;
-import core.sys.posix.dlfcn;
-import std.experimental.logger;
-import core.stdc.config;
-
-version(Windows) {
-    import core.sys.windows.windows;
-    alias DLSYM = GetProcAddress;
-    // Restricts the search, the DLL's own imports included, to the executable's directory and System32:
-    // the default order also covers the current directory and PATH.
-    enum DWORD LOAD_LIBRARY_SEARCH_APPLICATION_DIR = 0x00000200;
-    enum DWORD LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800;
-} else {
-    alias DLSYM = dlsym;
-}
-
-version(RequestsSkipSSL)
-{
-    enum enableSSL = false;
-}
-else
-{
-    enum enableSSL = true;
-}
-
-/*
- * /usr/include/openssl/tls1.h:# define TLS_ANY_VERSION 0x10000
- */
-
-immutable int TLS_ANY_VERSION = 0x10000;
-immutable int TLS1_VERSION = 0x0301;
-immutable int TLS1_2_VERSION = 0x0303;
-
-struct SSL {};
-struct SSL_CTX {};
-struct SSL_METHOD {};
-struct X509_VERIFY_PARAM {};
+struct SSL;
+struct SSL_CTX;
+struct SSL_METHOD;
+struct X509_VERIFY_PARAM;
 
 enum c_long X509_V_OK = 0;
 enum uint X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS = 0x4;
 
-//
-// N  - function name, R - return type, A - args
-//
-string SSL_Function_decl(string N, R, A...)() {
-    string F = "extern (C) @nogc nothrow %s function %s adapter_%s;".format(R.stringof, A.stringof, N);
-    return F;
-}
-string SSL_Function_set_i(string N, R, A...)() {
-    string F = "openssl.adapter_%s = cast(typeof(openssl.adapter_%s))DLSYM(cast(void*)openssl._libssl, \"%s\");".format(N, N, N);
-    return F;
-}
-string CRYPTO_Function_set_i(string N, R, A...)() {
-    string F = "openssl.adapter_%s = cast(typeof(openssl.adapter_%s))DLSYM(cast(void*)openssl._libcrypto, \"%s\");".format(N, N, N);
-    return F;
+/// Thrown by the first use of TLS when OpenSSL can't be loaded, isn't a supported version or fails to initialize.
+public class OpenSSLUnavailableException : Exception {
+    this(string message, string file = __FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
+        super(message, file, line, next);
+    }
 }
 
-private alias Version = Tuple!(int, "major", int, "minor");
+/// The major versions requests works with, newest first: the order the run-time loader tries them in.
+private immutable uint[] supportedMajors = [4, 3];
 
-immutable static OpenSSL openssl;
+// Every function requests calls. With RequestsOpenSSLStatic these are the linked symbols; otherwise only
+// their types are used.
+private extern (C) nothrow @nogc {
+    // libssl
+    int OPENSSL_init_ssl(ulong opts, const(void)* settings);
+    const(SSL_METHOD)* TLS_client_method();
+    SSL_CTX* SSL_CTX_new(const(SSL_METHOD)* method);
+    void SSL_CTX_free(SSL_CTX* ctx);
+    int SSL_CTX_set_default_verify_paths(SSL_CTX* ctx);
+    int SSL_CTX_load_verify_locations(SSL_CTX* ctx, const(char)* caFile, const(char)* caPath);
+    void SSL_CTX_set_verify(SSL_CTX* ctx, int mode, void* callback);
+    int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const(char)* file, int type);
+    int SSL_CTX_use_certificate_file(SSL_CTX* ctx, const(char)* file, int type);
+    SSL* SSL_new(SSL_CTX* ctx);
+    void SSL_free(SSL* ssl);
+    int SSL_set_fd(SSL* ssl, int fd);
+    int SSL_connect(SSL* ssl);
+    int SSL_read(SSL* ssl, void* buf, int num);
+    int SSL_write(SSL* ssl, const(void)* buf, int num);
+    int SSL_get_error(const(SSL)* ssl, int ret);
+    c_long SSL_ctrl(SSL* ssl, int cmd, c_long larg, void* parg);
+    X509_VERIFY_PARAM* SSL_get0_param(SSL* ssl);
+    c_long SSL_get_verify_result(const(SSL)* ssl);
 
-shared static this() {
-    version(OSX) {
-        enum loadFunction = "dlopen(lib.ptr, RTLD_LAZY)";
-        immutable string[] libsslname = [
-            "libssl.46.dylib",
-            "libssl.44.dylib",
-            "libssl.43.dylib",
-            "libssl.35.dylib",
-            "libssl.dylib",
-        ];
-        immutable string[] libcryptoname = [
-            "libcrypto.44.dylib",
-            "libcrypto.42.dylib",
-            "libcrypto.41.dylib",
-            "libcrypto.35.dylib",
-            "libcrypto.dylib",
-        ];
-    } else
-    version(linux) {
-        enum loadFunction = "dlopen(lib.ptr, RTLD_LAZY)";
-        immutable string[] libsslname = [
-            "libssl.so.3",
-            "libssl.so.1.1",
-            "libssl.so.1.0.2",
-            "libssl.so.1.0.1",
-            "libssl.so.1.0.0",
-            "libssl.so",
-        ];
-        immutable string[] libcryptoname = [
-            "libcrypto.so.3",
-            "libcrypto.so.1.1",
-            "libcrypto.so.1.0.2",
-            "libcrypto.so.1.0.1",
-            "libcrypto.so.1.0.0",
-            "libcrypto.so",
-        ];
-    } else
-    version(FreeBSD) {
-        enum loadFunction = "dlopen(lib.ptr, RTLD_LAZY)";
-        immutable string[] libsslname = [
-            "libssl.so.1.1",
-            "libssl.so.1.0.2",
-            "libssl.so.1.0.1",
-            "libssl.so.1.0.0",
-            "libssl.so",
-        ];
-        immutable string[] libcryptoname = [
-            "libcrypto.so.1.1",
-            "libcrypto.so.1.0.2",
-            "libcrypto.so.1.0.1",
-            "libcrypto.so.1.0.0",
-            "libcrypto.so",
-        ];
-    } else
-    version(Windows) {
-        enum loadFunction = "LoadLibraryExW(lib.ptr, null, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32)";
-        immutable wstring[] libsslname = [
-             "libssl-3-x64"w,
-             "libssl-3"w,
-             "libssl-1_1-x64"w,
-             "libssl-1_1"w,
-             "libssl32.dll"w,
-         ];
-         immutable wstring[] libcryptoname = [
-             "libcrypto-3-x64"w,
-             "libcrypto-3"w,
-             "libcrypto-1_1-x64"w,
-             "libcrypto-1_1"w,
-             "libeay32.dll"w,
-        ];
-    } else {
-        debug(requests) trace("error loading openssl: unsupported system - first access over https will fail");
-        return;
-    }
-
-    static if ( enableSSL && is(typeof(loadFunction)) ) {
-        foreach(lib; libsslname) {
-            openssl._libssl = cast(typeof(openssl._libssl))mixin(loadFunction);
-            if ( openssl._libssl !is null ) {
-                debug(requests) tracef("will use %s".format(lib));
-                break;
-            }
-        }
-        foreach(lib; libcryptoname) {
-            openssl._libcrypto = cast(typeof(openssl._libcrypto))mixin(loadFunction);
-            if ( openssl._libcrypto !is null ) {
-                debug(requests) tracef("will use %s".format(lib));
-                break;
-            }
-        }
-    }
-
-    if ( openssl._libssl is null ) {
-        debug(requests) trace("warning: failed to load libssl - first access over https will fail");
-        return;
-    }
-    if ( openssl._libcrypto is null ) {
-        debug(requests) trace("warning: failed to load libcrypto - first access over https will fail");
-        return;
-    }
-    openssl._ver = openssl.OpenSSL_version_detect();
-
-    mixin(SSL_Function_set_i!("SSL_library_init", int));
-    mixin(CRYPTO_Function_set_i!("OpenSSL_add_all_ciphers", void));
-    mixin(CRYPTO_Function_set_i!("OpenSSL_add_all_digests", void));
-    mixin(SSL_Function_set_i!("SSL_load_error_strings", void));
-
-    mixin(SSL_Function_set_i!("OPENSSL_init_ssl", int, ulong, void*));
-    mixin(CRYPTO_Function_set_i!("OPENSSL_init_crypto", int, ulong, void*));
-
-    mixin(SSL_Function_set_i!("TLSv1_client_method", SSL_METHOD*));
-    mixin(SSL_Function_set_i!("TLSv1_2_client_method", SSL_METHOD*));
-    mixin(SSL_Function_set_i!("TLS_method", SSL_METHOD*));
-    mixin(SSL_Function_set_i!("SSLv23_client_method", SSL_METHOD*));
-    mixin(SSL_Function_set_i!("SSL_CTX_new", SSL_CTX*, SSL_METHOD*));
-    mixin(SSL_Function_set_i!("SSL_CTX_set_default_verify_paths", int, SSL_CTX*));
-    mixin(SSL_Function_set_i!("SSL_CTX_load_verify_locations", int, SSL_CTX*, char*, char*));
-    mixin(SSL_Function_set_i!("SSL_CTX_set_verify", void, SSL_CTX*, int, void*));
-    mixin(SSL_Function_set_i!("SSL_CTX_use_PrivateKey_file", int, SSL_CTX*, const char*, int));
-    mixin(SSL_Function_set_i!("SSL_CTX_use_certificate_file", int, SSL_CTX*, const char*, int));
-    mixin(SSL_Function_set_i!("SSL_CTX_set_cipher_list", int, SSL_CTX*, const char*));
-    mixin(SSL_Function_set_i!("SSL_CTX_ctrl", c_long, SSL_CTX*, int, c_long, void*));
-    mixin(SSL_Function_set_i!("SSL_new", SSL*, SSL_CTX*));
-    mixin(SSL_Function_set_i!("SSL_set_fd", int, SSL*, int));
-    mixin(SSL_Function_set_i!("SSL_connect", int, SSL*));
-    mixin(SSL_Function_set_i!("SSL_write", int, SSL*, const void*, int));
-    mixin(SSL_Function_set_i!("SSL_read", int, SSL*, void*, int));
-    mixin(SSL_Function_set_i!("SSL_free", void, SSL*));
-    mixin(SSL_Function_set_i!("SSL_CTX_free", void, SSL_CTX*));
-    mixin(SSL_Function_set_i!("SSL_get_error", int, SSL*, int));
-    mixin(SSL_Function_set_i!("SSL_ctrl", c_long, SSL*, int, c_long, void*));
-    mixin(SSL_Function_set_i!("SSL_get0_param", X509_VERIFY_PARAM*, SSL*));
-    mixin(SSL_Function_set_i!("SSL_get_verify_result", c_long, const(SSL)*));
-    mixin(CRYPTO_Function_set_i!("ERR_reason_error_string", char*, c_ulong));
-    mixin(CRYPTO_Function_set_i!("ERR_get_error", c_ulong));
-    mixin(CRYPTO_Function_set_i!("X509_VERIFY_PARAM_set1_host", int, X509_VERIFY_PARAM*, const(char)*, size_t));
-    mixin(CRYPTO_Function_set_i!("X509_VERIFY_PARAM_set_hostflags", void, X509_VERIFY_PARAM*, uint));
-    mixin(CRYPTO_Function_set_i!("X509_VERIFY_PARAM_set1_ip_asc", int, X509_VERIFY_PARAM*, const(char)*));
-    mixin(CRYPTO_Function_set_i!("X509_verify_cert_error_string", const(char)*, c_long));
-
-    void delegate()[Version] init_matrix;
-    init_matrix[Version(1,0)] = &openssl.init1_0;
-    init_matrix[Version(1,1)] = &openssl.init1_1;
-    init_matrix[Version(2,0)] = &openssl.init1_1;
-    init_matrix[Version(0,2)] = &openssl.init1_1; // libressl >= 2.7.1
-    init_matrix[Version(0,3)] = &openssl.init1_1; // libressl >= 3.0.0
-    init_matrix[Version(3,0)] = &openssl.init1_1; // >=3.0
-    auto initVer = (ver) {
-        if (ver.major == 3 && ver.minor >= 1) // set 3.x to 3.0 for the init matrix
-            return Version(3, 0);
-        else
-            return ver;
-    }(openssl._ver);
-    auto init = init_matrix.get(initVer, null);
-    if ( init is null ) {
-        throw new Exception("loading openssl: unknown version %s for init".format(openssl._ver));
-    }
-    init();
+    // libcrypto
+    uint OPENSSL_version_major();
+    uint OPENSSL_version_minor();
+    uint OPENSSL_version_patch();
+    const(char)* OpenSSL_version(int type);
+    c_ulong ERR_get_error();
+    const(char)* ERR_reason_error_string(c_ulong e);
+    int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM* param, const(char)* name, size_t namelen);
+    void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM* param, uint flags);
+    int X509_VERIFY_PARAM_set1_ip_asc(X509_VERIFY_PARAM* param, const(char)* ip);
+    const(char)* X509_verify_cert_error_string(c_long n);
 }
 
+private enum libsslFunctions = [
+    "OPENSSL_init_ssl",
+    "TLS_client_method",
+    "SSL_CTX_new",
+    "SSL_CTX_free",
+    "SSL_CTX_set_default_verify_paths",
+    "SSL_CTX_load_verify_locations",
+    "SSL_CTX_set_verify",
+    "SSL_CTX_use_PrivateKey_file",
+    "SSL_CTX_use_certificate_file",
+    "SSL_new",
+    "SSL_free",
+    "SSL_set_fd",
+    "SSL_connect",
+    "SSL_read",
+    "SSL_write",
+    "SSL_get_error",
+    "SSL_ctrl",
+    "SSL_get0_param",
+    "SSL_get_verify_result",
+];
+
+private enum libcryptoFunctions = [
+    "OPENSSL_version_major",
+    "OPENSSL_version_minor",
+    "OPENSSL_version_patch",
+    "OpenSSL_version",
+    "ERR_get_error",
+    "ERR_reason_error_string",
+    "X509_VERIFY_PARAM_set1_host",
+    "X509_VERIFY_PARAM_set_hostflags",
+    "X509_VERIFY_PARAM_set1_ip_asc",
+    "X509_verify_cert_error_string",
+];
+
+private enum OPENSSL_VERSION = 0;
+
+// OPENSSL_INIT_* from crypto.h and ssl.h, the same in 3.0 through 4.1.
+private enum ulong OPENSSL_INIT_LOAD_CRYPTO_STRINGS = 0x00000002;
+private enum ulong OPENSSL_INIT_NO_LOAD_CONFIG = 0x00000080;
+private enum ulong OPENSSL_INIT_NO_ATEXIT = 0x00080000;
+private enum ulong OPENSSL_INIT_LOAD_SSL_STRINGS = 0x00200000;
+
+/**
+ * No openssl.cnf: OPENSSL_CONF can point it anywhere, and it can load modules into the process. No cleanup
+ * from atexit, which runs while daemon threads may still be inside OpenSSL.
+ */
+private enum ulong initOptions = OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS
+    | OPENSSL_INIT_NO_LOAD_CONFIG | OPENSSL_INIT_NO_ATEXIT;
+
+/// The bound functions, from `openssl`.
 struct OpenSSL {
+    /// What the library calls itself, such as "OpenSSL 3.5.9 29 Sep 2026".
+    string versionText;
 
-    private {
-        Version         _ver;
-        void*           _libssl;
-        void*           _libcrypto;
-
-        // openssl 1.0.x init functions
-        mixin(SSL_Function_decl!("SSL_library_init", int));
-        mixin(SSL_Function_decl!("OpenSSL_add_all_ciphers", void));
-        mixin(SSL_Function_decl!("OpenSSL_add_all_digests", void));
-        mixin(SSL_Function_decl!("SSL_load_error_strings", void));
-
-        // openssl 1.1.x init functions
-        mixin(SSL_Function_decl!("OPENSSL_init_ssl", int, ulong, void*)); // fixed width 64 bit arg
-        mixin(SSL_Function_decl!("OPENSSL_init_crypto", int, ulong, void*)); // fixed width 64 bit arg
-
-        // all other functions
-        mixin(SSL_Function_decl!("TLSv1_client_method", SSL_METHOD*));
-        mixin(SSL_Function_decl!("TLSv1_2_client_method", SSL_METHOD*));
-        mixin(SSL_Function_decl!("TLS_method", SSL_METHOD*));
-        mixin(SSL_Function_decl!("SSLv23_client_method", SSL_METHOD*));
-        mixin(SSL_Function_decl!("SSL_CTX_new", SSL_CTX*, SSL_METHOD*));
-        mixin(SSL_Function_decl!("SSL_CTX_set_default_verify_paths", int, SSL_CTX*));
-        mixin(SSL_Function_decl!("SSL_CTX_load_verify_locations", int, SSL_CTX*, char*, char*));
-        mixin(SSL_Function_decl!("SSL_CTX_set_verify", void, SSL_CTX*, int, void*));
-        mixin(SSL_Function_decl!("SSL_CTX_use_PrivateKey_file", int, SSL_CTX*, const char*, int));
-        mixin(SSL_Function_decl!("SSL_CTX_use_certificate_file", int, SSL_CTX*, const char*, int));
-        mixin(SSL_Function_decl!("SSL_CTX_set_cipher_list", int, SSL_CTX*, const char*));
-        mixin(SSL_Function_decl!("SSL_CTX_ctrl", c_long, SSL_CTX*, int, c_long, void*));
-        mixin(SSL_Function_decl!("SSL_new", SSL*, SSL_CTX*));
-        mixin(SSL_Function_decl!("SSL_set_fd", int, SSL*, int));
-        mixin(SSL_Function_decl!("SSL_connect", int, SSL*));
-        mixin(SSL_Function_decl!("SSL_write", int, SSL*, const void*, int));
-        mixin(SSL_Function_decl!("SSL_read", int, SSL*, void*, int));
-        mixin(SSL_Function_decl!("SSL_free", void, SSL*));
-        mixin(SSL_Function_decl!("SSL_CTX_free", void, SSL_CTX*));
-        mixin(SSL_Function_decl!("SSL_get_error", int, SSL*, int));
-        mixin(SSL_Function_decl!("SSL_ctrl", c_long, SSL*, int, c_long, void*));
-        mixin(SSL_Function_decl!("SSL_get0_param", X509_VERIFY_PARAM*, SSL*));
-        mixin(SSL_Function_decl!("SSL_get_verify_result", c_long, const(SSL)*));
-        mixin(SSL_Function_decl!("ERR_reason_error_string", char*, c_ulong));
-        mixin(SSL_Function_decl!("ERR_get_error", c_ulong));
-        mixin(SSL_Function_decl!("X509_VERIFY_PARAM_set1_host", int, X509_VERIFY_PARAM*, const(char)*, size_t));
-        mixin(SSL_Function_decl!("X509_VERIFY_PARAM_set_hostflags", void, X509_VERIFY_PARAM*, uint));
-        mixin(SSL_Function_decl!("X509_VERIFY_PARAM_set1_ip_asc", int, X509_VERIFY_PARAM*, const(char)*));
-        mixin(SSL_Function_decl!("X509_verify_cert_error_string", const(char)*, c_long));
+    static foreach (name; libsslFunctions ~ libcryptoFunctions) {
+        mixin("typeof(&." ~ name ~ ") " ~ name ~ ";");
     }
 
-    Version reportVersion() const @nogc nothrow pure {
-        return _ver;
-    };
-
-    private Version OpenSSL_version_detect() const {
-        c_ulong function() OpenSSL_version_num = cast(c_ulong function())DLSYM(cast(void*)_libcrypto, "OpenSSL_version_num".ptr);
-        if ( OpenSSL_version_num ) {
-            auto v = OpenSSL_version_num() & 0xffffffff;
-            return Version((v>>>28) & 0xff, (v>>>20) & 0xff);
-        }
-        return Version(1, 0);
-    }
-
-    private void init1_0() const {
-        adapter_SSL_library_init();
-        adapter_OpenSSL_add_all_ciphers();
-        adapter_OpenSSL_add_all_digests();
-        adapter_SSL_load_error_strings();
-    }
-    private void init1_1() const {
-        /**
-        Standard initialisation options
-
-        #define OPENSSL_INIT_LOAD_SSL_STRINGS       0x00200000L
-
-        # define OPENSSL_INIT_LOAD_CRYPTO_STRINGS    0x00000002L
-        # define OPENSSL_INIT_ADD_ALL_CIPHERS        0x00000004L
-        # define OPENSSL_INIT_ADD_ALL_DIGESTS        0x00000008L
-        **/
-        enum OPENSSL_INIT_LOAD_SSL_STRINGS = 0x00200000L;
-        enum OPENSSL_INIT_LOAD_CRYPTO_STRINGS = 0x00000002L;
-        enum OPENSSL_INIT_ADD_ALL_CIPHERS = 0x00000004L;
-        enum OPENSSL_INIT_ADD_ALL_DIGESTS = 0x00000008L;
-        adapter_OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS, null);
-        adapter_OPENSSL_init_crypto(OPENSSL_INIT_ADD_ALL_CIPHERS | OPENSSL_INIT_ADD_ALL_DIGESTS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, null);
-    }
-
-    SSL_METHOD* TLSv1_client_method() const {
-        if ( adapter_TLSv1_client_method is null ) {
-            throw new Exception("openssl not initialized - is it installed?");
-        }
-        return adapter_TLSv1_client_method();
-    }
-    SSL_METHOD* TLSv1_2_client_method() const {
-        if ( adapter_TLSv1_2_client_method is null ) {
-            throw new Exception("openssl not initialized - is it installed?");
-        }
-        return adapter_TLSv1_2_client_method();
-    }
-    SSL_METHOD* SSLv23_client_method() const {
-        if ( adapter_SSLv23_client_method is null ) {
-            throw new Exception("can't complete call to SSLv23_client_method");
-        }
-        return adapter_SSLv23_client_method();
-    }
-    SSL_METHOD* TLS_method() const {
-        if ( adapter_TLS_method !is null ) {
-            return adapter_TLS_method();
-        }
-        if ( adapter_SSLv23_client_method !is null ) {
-            return adapter_SSLv23_client_method();
-        }
-        throw new Exception("can't complete call to TLS_method");
-    }
-    SSL_CTX* SSL_CTX_new(SSL_METHOD* method) const {
-        if ( adapter_SSL_CTX_new is null ) {
-            throw new Exception("openssl not initialized - is it installed?");
-        }
-        return adapter_SSL_CTX_new(method);
-    }
-    int SSL_CTX_set_default_verify_paths(SSL_CTX* ctx) const @nogc nothrow {
-        return adapter_SSL_CTX_set_default_verify_paths(ctx);
-    }
-    int SSL_CTX_load_verify_locations(SSL_CTX* ctx, char* CAFile, char* CAPath) const @nogc nothrow {
-        return adapter_SSL_CTX_load_verify_locations(ctx, CAFile, CAPath);
-    }
-    void SSL_CTX_set_verify(SSL_CTX* ctx, int mode, void* callback) const @nogc nothrow {
-        adapter_SSL_CTX_set_verify(ctx, mode, callback);
-    }
-    int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const char* file, int type) const @nogc nothrow {
-        return adapter_SSL_CTX_use_PrivateKey_file(ctx, file, type);
-    }
-    int SSL_CTX_use_certificate_file(SSL_CTX* ctx, const char* file, int type) const @nogc nothrow {
-        return adapter_SSL_CTX_use_certificate_file(ctx, file, type);
-    }
-    int SSL_CTX_set_cipher_list(SSL_CTX* ssl_ctx, const char* c) const @nogc nothrow {
-        return adapter_SSL_CTX_set_cipher_list(ssl_ctx, c);
-    }
-    /*
-     *
-     * # define SSL_CTRL_SET_MIN_PROTO_VERSION          123
-     * # define SSL_CTRL_SET_MAX_PROTO_VERSION          124
-    */
-    enum int SSL_CTRL_SET_MIN_PROTO_VERSION = 123;
-    enum int SSL_CTRL_SET_MAX_PROTO_VERSION = 124;
-    int SSL_CTX_set_min_proto_version(SSL_CTX* ctx, int v) const @nogc nothrow {
-        int r = cast(int)adapter_SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, cast(c_long)v, null);
-        return r;
-    }
-    int SSL_CTX_set_max_proto_version(SSL_CTX* ctx, int v) const @nogc nothrow {
-        int r = cast(int)adapter_SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, cast(c_long)v, null);
-        return r;
-    }
-    SSL* SSL_new(SSL_CTX* ctx) const @nogc nothrow {
-        return adapter_SSL_new(ctx);
-    }
-    int SSL_set_fd(SSL* ssl, int fd) const @nogc nothrow {
-        return adapter_SSL_set_fd(ssl, fd);
-    }
-    int SSL_connect(SSL* ssl) const @nogc nothrow {
-        return adapter_SSL_connect(ssl);
-    }
-    int SSL_read(SSL* ssl, void *b, int n) const @nogc nothrow {
-        return adapter_SSL_read(ssl, b, n);
-    }
-    int SSL_write(SSL* ssl, const void *b, int n) const @nogc nothrow {
-        return adapter_SSL_write(ssl, b, n);
-    }
-    void SSL_free(SSL* ssl) const @nogc nothrow @trusted {
-        adapter_SSL_free(ssl);
-    }
-    void SSL_CTX_free(SSL_CTX* ctx) const @nogc nothrow @trusted {
-        adapter_SSL_CTX_free(ctx);
-    }
-    int SSL_get_error(SSL* ssl, int err) const @nogc nothrow {
-        return adapter_SSL_get_error(ssl, err);
-    }
-    c_long SSL_set_tlsext_host_name(SSL* ssl, const char* host) const @nogc nothrow {
+    c_long SSL_set_tlsext_host_name(SSL* ssl, const(char)* host) const @nogc nothrow {
         enum SSL_CTRL_SET_TLSEXT_HOSTNAME = 55;
         enum TLSEXT_NAMETYPE_host_name = 0;
-        return adapter_SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME,TLSEXT_NAMETYPE_host_name, cast(void*)host);
-    }
-    char* ERR_reason_error_string(c_ulong code) const @nogc nothrow {
-        return adapter_ERR_reason_error_string(code);
-    }
-    c_ulong ERR_get_error() const @nogc nothrow {
-        return adapter_ERR_get_error();
-    }
-    /// Whether every function needed to verify the peer's host name was found.
-    bool hostVerificationAvailable() const @nogc nothrow {
-        return adapter_SSL_get0_param !is null
-            && adapter_SSL_get_verify_result !is null
-            && adapter_X509_VERIFY_PARAM_set1_host !is null
-            && adapter_X509_VERIFY_PARAM_set_hostflags !is null
-            && adapter_X509_VERIFY_PARAM_set1_ip_asc !is null;
-    }
-    X509_VERIFY_PARAM* SSL_get0_param(SSL* ssl) const @nogc nothrow {
-        return adapter_SSL_get0_param(ssl);
-    }
-    c_long SSL_get_verify_result(const(SSL)* ssl) const @nogc nothrow {
-        return adapter_SSL_get_verify_result(ssl);
-    }
-    int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM* param, const(char)* name, size_t namelen) const @nogc nothrow {
-        return adapter_X509_VERIFY_PARAM_set1_host(param, name, namelen);
-    }
-    void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM* param, uint flags) const @nogc nothrow {
-        adapter_X509_VERIFY_PARAM_set_hostflags(param, flags);
-    }
-    int X509_VERIFY_PARAM_set1_ip_asc(X509_VERIFY_PARAM* param, const(char)* ip) const @nogc nothrow {
-        return adapter_X509_VERIFY_PARAM_set1_ip_asc(param, ip);
-    }
-    /// Returns null when the function is missing.
-    const(char)* X509_verify_cert_error_string(c_long n) const @nogc nothrow {
-        if ( adapter_X509_verify_cert_error_string is null ) {
-            return null;
-        }
-        return adapter_X509_verify_cert_error_string(n);
+        return SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, cast(void*) host);
     }
 }
-/*
-int main() {
-    import std.socket;
 
-    auto v = openssl.reportVersion();
-    writefln("openSSL v.%s.%s", v.major, v.minor);
-    openssl.SSL_library_init();
-    writeln("InitSSL - ok");
-    SSL_CTX* ctx = openssl.SSL_CTX_new(openssl.TLSv1_client_method());
-    writefln("SSL_CTX_new = %x", ctx);
-    int r = openssl.adapter_SSL_CTX_set_default_verify_paths(ctx);
-    writefln("SSL_CTX_set_default_verify_paths = %d(%s)", r, r==1?"ok":"fail");
-    r = openssl.adapter_SSL_CTX_load_verify_locations(ctx, cast(char*)null, cast(char*)null);
-    writefln("SSL_CTX_load_verify_locations - ok");
-    openssl.SSL_CTX_set_verify(ctx, 0, null);
-    writefln("SSL_CTX_set_verify - ok");
-    //r = openssl.SSL_CTX_use_PrivateKey_file(ctx, null, 0);
-    //writefln("SSL_CTX_use_PrivateKey_file = %d(%s)", r, r==1?"ok":"fail");
-    //r = openssl.SSL_CTX_use_certificate_file(ctx, cast(char*), 0);
-    //writefln("SSL_CTX_use_certificate_file = %d(%s)", r, r==1?"ok":"fail");
-    SSL* ssl = openssl.SSL_new(ctx);
-    writefln("SSL_new = %x", ssl);
-    auto s = new Socket(AddressFamily.INET, SocketType.STREAM, ProtocolType.TCP);
-    Address[] a = getAddress("ns.od.ua", 443);
-    writeln(a[0]);
-    s.connect(a[0]);
-    r = openssl.SSL_set_fd(ssl, s.handle);
-    writefln("SSL_set_fd = %d(%s)", r, r==1?"ok":"fail");
-    r = openssl.SSL_connect(ssl);
-    writefln("SSL_connect = %d(%s)", r, r==1?"ok":"fail");
-    if ( r < 0 ) {
-        writefln("code: %d", openssl.SSL_get_error(ssl, r));
-    }
-    string req = "GET / HTTP/1.0\n\n";
-    r = openssl.SSL_write(ssl, cast(void*)req.ptr, cast(int)req.length);
-    writefln("SSL_write = %d", r);
-    do {
-        ubyte[]  resp = new ubyte[](1024);
-        r = openssl.SSL_read(ssl, cast(void*)resp.ptr, cast(int)1024);
-        writefln("SSL_read = %d", r);
-        if ( r > 0 ) {
-            writeln(cast(string)resp);
-        }
-    } while(r > 0);
-    openssl.SSL_free(ssl);
-    openssl.SSL_CTX_free(ctx);
-    s.close();
-    return 0;
+private struct Unavailable {
+    string reason;
 }
-*/
+
+private alias Binding = SumType!(OpenSSL, Unavailable);
+
+private __gshared Binding binding;
+
+/// The OpenSSL functions, bound by the first call; throws `OpenSSLUnavailableException` when OpenSSL can't be used.
+ref const(OpenSSL) openssl() @trusted {
+    return *initOnce!binding(bind()).match!(
+        (ref OpenSSL api) => &api,
+        (ref Unavailable u) => throw new OpenSSLUnavailableException(u.reason),
+    );
+}
+
+/// Why requests can't use OpenSSL `major.minor.patch`, or null when it can.
+private string unsupportedVersion(uint major, uint minor, uint patch) pure @safe {
+    if ( supportedMajors.canFind(major) ) {
+        return null;
+    }
+    return "OpenSSL %d.%d.%d is not supported, only major versions %(%d, %)".format(major, minor, patch, supportedMajors);
+}
+
+unittest {
+    assert(unsupportedVersion(3, 0, 0) is null);
+    assert(unsupportedVersion(3, 6, 5) is null);
+    assert(unsupportedVersion(4, 1, 0) is null);
+    assert(unsupportedVersion(1, 1, 1) == "OpenSSL 1.1.1 is not supported, only major versions 4, 3");
+    assert(unsupportedVersion(5, 0, 0) == "OpenSSL 5.0.0 is not supported, only major versions 4, 3");
+}
+
+private Binding bind() nothrow {
+    try {
+        version (RequestsOpenSSLStatic) {
+            OpenSSL api;
+            static foreach (name; libsslFunctions ~ libcryptoFunctions) {
+                mixin("api." ~ name ~ " = &." ~ name ~ ";");
+            }
+            return initialize(api);
+        } else {
+            return load();
+        }
+    } catch (Exception e) {
+        return Binding(Unavailable(e.msg));
+    }
+}
+
+/// Checks the version of `api`'s library and initializes it.
+private Binding initialize(OpenSSL api) {
+    if ( auto why = unsupportedVersion(api.OPENSSL_version_major(), api.OPENSSL_version_minor(), api.OPENSSL_version_patch()) ) {
+        return Binding(Unavailable(why));
+    }
+    if ( api.OPENSSL_init_ssl(initOptions, null) != 1 ) {
+        auto reason = api.ERR_reason_error_string(api.ERR_get_error());
+        return Binding(Unavailable("OPENSSL_init_ssl failed: %s".format(reason is null ? "no reason given" : reason.fromStringz)));
+    }
+    api.versionText = api.OpenSSL_version(OPENSSL_VERSION).fromStringz.idup;
+    return Binding(api);
+}
+
+version (RequestsOpenSSLStatic) {
+} else:
+
+version (Windows) {
+    import core.sys.windows.winbase : GetLastError, GetModuleHandleW, GetProcAddress, LoadLibraryExW;
+    import core.sys.windows.windef : DWORD;
+    import std.utf : toUTF16z;
+
+    // The search, the DLL's own imports included, covers only the executable's directory and System32:
+    // the default order also covers the current directory and PATH.
+    private enum DWORD LOAD_LIBRARY_SEARCH_APPLICATION_DIR = 0x00000200;
+    private enum DWORD LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800;
+
+    // OpenSSL names its DLLs after the major version and the architecture.
+    version (X86_64) {
+    } else {
+        static assert(false, "requests loads OpenSSL DLLs on x64 only");
+    }
+
+    private string libsslName(uint major) pure @safe {
+        return "libssl-%d-x64.dll".format(major);
+    }
+
+    private string libcryptoName(uint major) pure @safe {
+        return "libcrypto-%d-x64.dll".format(major);
+    }
+
+    private void* symbol(void* library, string name) {
+        return cast(void*) GetProcAddress(library, name.toStringz);
+    }
+
+    private Binding load() {
+        string[] failures;
+        foreach (major; supportedMajors) {
+            immutable name = libsslName(major);
+            auto ssl = LoadLibraryExW(name.toUTF16z, null, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if ( ssl is null ) {
+                failures ~= "%s: error %d".format(name, GetLastError());
+                continue;
+            }
+            // GetProcAddress doesn't search a DLL's imports. A loaded module is found by its name, so this is
+            // the libcrypto that libssl's imports are bound to.
+            auto crypto = GetModuleHandleW(libcryptoName(major).toUTF16z);
+            if ( crypto is null ) {
+                return Binding(Unavailable("%s is loaded without %s".format(name, libcryptoName(major))));
+            }
+            return bindLibrary(name, ssl, crypto, major);
+        }
+        return Binding(Unavailable("OpenSSL not found in the executable's directory or System32: %-(%s; %)".format(failures)));
+    }
+} else version (Posix) {
+    import core.sys.posix.dlfcn : dlerror, dlopen, dlsym, RTLD_NOLOAD, RTLD_NOW;
+
+    version (OSX) {
+        // Never the unversioned libssl.dylib: on macOS that is a stub which aborts the process.
+        private string libsslName(uint major) pure @safe {
+            return "libssl.%d.dylib".format(major);
+        }
+    } else version (linux) {
+        private string libsslName(uint major) pure @safe {
+            return "libssl.so.%d".format(major);
+        }
+    } else {
+        static assert(false, "requests loads OpenSSL on Windows, Linux and macOS");
+    }
+
+    private void* symbol(void* library, string name) {
+        return dlsym(library, name.toStringz);
+    }
+
+    // Through libssl's handle dlsym searches libssl and then what it links, so libcrypto's functions come
+    // from the copy that libssl uses.
+    private Binding load() {
+        // A copy already in the process comes first, so that requests doesn't add a second one.
+        foreach (major; supportedMajors) {
+            immutable name = libsslName(major);
+            if ( auto ssl = dlopen(name.toStringz, RTLD_NOW | RTLD_NOLOAD) ) {
+                return bindLibrary(name, ssl, ssl, major);
+            }
+        }
+        string[] failures;
+        foreach (major; supportedMajors) {
+            immutable name = libsslName(major);
+            if ( auto ssl = dlopen(name.toStringz, RTLD_NOW) ) {
+                return bindLibrary(name, ssl, ssl, major);
+            }
+            failures ~= dlerror().fromStringz.idup;
+        }
+        return Binding(Unavailable("OpenSSL not found: %-(%s; %)".format(failures)));
+    }
+}
+
+/// Binds the functions of `name`, loaded as `ssl`, and of its libcrypto `crypto`, found under `major`'s names.
+private Binding bindLibrary(string name, void* ssl, void* crypto, uint major) {
+    OpenSSL api;
+    string[] missing;
+    static foreach (f; libsslFunctions) {
+        mixin("api." ~ f) = cast(typeof(mixin("api." ~ f))) symbol(ssl, f);
+        if ( mixin("api." ~ f) is null ) {
+            missing ~= f;
+        }
+    }
+    static foreach (f; libcryptoFunctions) {
+        mixin("api." ~ f) = cast(typeof(mixin("api." ~ f))) symbol(crypto, f);
+        if ( mixin("api." ~ f) is null ) {
+            missing ~= f;
+        }
+    }
+    if ( api.OPENSSL_version_major is null || api.OPENSSL_version_minor is null || api.OPENSSL_version_patch is null ) {
+        // Before 3.0 only OpenSSL_version_num tells the version.
+        alias VersionNum = extern (C) c_ulong function() nothrow @nogc;
+        auto versionNum = cast(VersionNum) symbol(crypto, "OpenSSL_version_num");
+        if ( versionNum is null ) {
+            return Binding(Unavailable("%s doesn't report its OpenSSL version".format(name)));
+        }
+        immutable v = versionNum();
+        return Binding(Unavailable("%s is OpenSSL %d.%d, not %d".format(name, (v >> 28) & 0xf, (v >> 20) & 0xff, major)));
+    }
+    if ( api.OPENSSL_version_major() != major ) {
+        return Binding(Unavailable("%s is OpenSSL %d.%d.%d".format(name,
+            api.OPENSSL_version_major(), api.OPENSSL_version_minor(), api.OPENSSL_version_patch())));
+    }
+    if ( missing.length > 0 ) {
+        return Binding(Unavailable("%s lacks %-(%s, %)".format(name, missing)));
+    }
+    return initialize(api);
+}

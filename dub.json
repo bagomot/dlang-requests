@@ -12,13 +12,15 @@
     },
     "configurations": [
         {
-            "name": "std"
+            "name": "openssl-dynamic"
         },
         {
-            "name": "staticssl",
-            "versions": ["staticssl"],
-            "libs": [":libssl.a", ":libcrypto.a"],
-            "platforms": ["linux"]
+            "name": "openssl-static",
+            "platforms": ["windows", "linux"],
+            "versions": ["RequestsOpenSSLStatic"],
+            "libs-windows": ["libssl", "libcrypto", "ws2_32", "gdi32", "advapi32", "crypt32", "user32"],
+            "libs-linux": [":libssl.a", ":libcrypto.a", "dl", "pthread"],
+            "lflags-linux": ["--exclude-libs=libssl.a:libcrypto.a"]
         }
     ],
     "buildTypes": {
