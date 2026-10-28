@@ -1,0 +1,8 @@
+/.dub/
+/dub.selections.json
+*.dll
+*.exe
+*.pdb
+*.lib
+*.a
+tls-tests-test-*
