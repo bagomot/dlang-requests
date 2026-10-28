@@ -1125,6 +1125,16 @@ public class TCPSocketStream : SocketStream {
     }
 }
 
+/// The error of the last failed socket call: WinSock reports it through `WSAGetLastError` and leaves `errno` alone.
+private int lastSocketErrorCode() @trusted nothrow @nogc {
+    version(Windows) {
+        import core.sys.windows.winsock2 : WSAGetLastError;
+        return WSAGetLastError();
+    } else {
+        return errno;
+    }
+}
+
 public interface NetworkStream {
     @property bool isConnected() const;
     @property bool isOpen() const;
@@ -1231,8 +1241,9 @@ public abstract class SocketStream : NetworkStream {
     do {
         auto rc = s.send(buff);
         if (rc < 0) {
+            immutable e = lastSocketErrorCode();
             close();
-            throw new NetworkException("sending data: %s".format(to!string(strerror(errno))));
+            throw new NetworkException("sending data: %s".format(formatSocketError(e)));
         }
         return rc;
     }
@@ -1241,13 +1252,14 @@ public abstract class SocketStream : NetworkStream {
         while (true) {
             auto r = s.receive(buff);
             if (r < 0) {
-                auto e = errno;
+                immutable e = lastSocketErrorCode();
                 version(Windows) {
+                    import core.sys.windows.winsock2 : WSAETIMEDOUT;
                     close();
-                    if ( e == 0 ) {
+                    if ( e == WSAETIMEDOUT ) {
                         throw new TimeoutException("Timeout receiving data");
                     }
-                    throw new NetworkException("Unexpected error %s while receiving data".format(to!string(strerror(errno))));
+                    throw new NetworkException("Unexpected error %s while receiving data".format(formatSocketError(e)));
                 }
                 version(Posix) {
                     if ( e == EINTR ) {
@@ -1257,7 +1269,7 @@ public abstract class SocketStream : NetworkStream {
                     if ( e == EAGAIN ) {
                         throw new TimeoutException("Timeout receiving data");
                     }
-                    throw new NetworkException("Unexpected error %s while receiving data".format(to!string(strerror(errno))));
+                    throw new NetworkException("Unexpected error %s while receiving data".format(formatSocketError(e)));
                 }
             }
             else {
