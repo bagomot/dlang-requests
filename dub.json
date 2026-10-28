@@ -30,10 +30,6 @@
             "dflags-ldc": ["-d-debug=requests"],
             "versions": ["httpbin"]
         },
-        "docs": {
-            "buildOptions": ["syntaxOnly"],
-            "dflags" : ["-c", "-Dddocs"]
-        },
         "unittest": {
             "buildOptions": ["unittests", "debugMode", "debugInfo"],
             "versions": ["httpbin"],
