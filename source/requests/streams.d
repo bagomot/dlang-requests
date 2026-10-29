@@ -1595,16 +1595,6 @@ public class SSLSocketStream: SocketStream {
 
 /// A plain TCP connection.
 public class TCPSocketStream : SocketStream {
-    override TCPSocketStream accept() {
-        auto newso = s.accept();
-        newso.blocking = false;
-        auto newstream = new TCPSocketStream();
-        newstream.s = newso;
-        newstream.__isOpen = true;
-        newstream.__isConnected = true;
-        newstream.s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
-        return newstream;
-    }
 }
 
 public interface NetworkStream {
@@ -1621,11 +1611,8 @@ public interface NetworkStream {
     /// Receives into `buff`; 0 when the peer has closed the connection.
     ptrdiff_t receive(void[] buff);
 
-    NetworkStream accept();
-    @property void reuseAddr(bool);
-    void bind(string);
-    void bind(Address);
-    void listen(int);
+    /// Binds the connection to local address `to` when it connects.
+    void bind(string to);
     Socket so();
     /// Sets the limits on sending and receiving, and starts the low-speed check over.
     @property void limits(NetworkLimits limits);
@@ -1644,12 +1631,6 @@ public abstract class SocketStream : NetworkStream {
         NetworkLimits _limits;
         Duration _windowTime;   // time spent in receive() in the current low-speed window
         ulong    _windowBytes;  // bytes received in it
-    }
-    /// Opens a blocking socket, to bind and listen on.
-    void open(AddressFamily fa) {
-        closeSocket();
-        s = new Socket(fa, SocketType.STREAM, ProtocolType.TCP);
-        __isOpen = true;
     }
     @property Socket so() @safe pure {
         return s;
@@ -1900,24 +1881,6 @@ public abstract class SocketStream : NetworkStream {
         _windowTime = Duration.zero;
         _windowBytes = 0;
     }
-
-    override SocketStream accept() {
-        assert(false, "Implement before use");
-    }
-    @property override void reuseAddr(bool yes){
-        if (yes) {
-            s.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, 1);
-        }
-        else {
-            s.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, 0);
-        }
-    }
-    override void bind(Address addr){
-        s.bind(addr);
-    }
-    override void listen(int n) {
-        s.listen(n);
-    };
 }
 
 public alias TCPStream = TCPSocketStream;
