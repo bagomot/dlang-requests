@@ -185,6 +185,52 @@ unittest {
     inChunks(got[11], "ab");
 }
 
+@("an empty body is no body to GET, HEAD, DELETE and OPTIONS, nor a body of a request that failed to the next one")
+unittest {
+    import std.socket : Socket;
+
+    auto server = new HttpServer((Received r) => response("ok"));
+    scope (exit) server.stop();
+    immutable url = "http://127.0.0.1:%d/".format(server.port);
+    auto rq = client();
+    foreach (method; ["GET", "HEAD", "DELETE", "OPTIONS", "POST"]) {
+        rq.execute(method, url, "", "application/json");
+    }
+    // A body that never went out, refused with the proxy before connecting, stays behind.
+    void failToPost() {
+        rq.proxy = "https://127.0.0.1:1";
+        scope (exit) rq.proxy = null;
+        enforce(collectException!ConnectError(rq.post(url, "stale")) !is null);
+    }
+
+    failToPost();
+    rq.get(url);
+    failToPost();
+    rq.post(url, MultipartForm().add(formData("part", "data")));
+    auto got = server.received;
+    enforce(got.length == 7, "%d requests".format(got.length));
+    foreach (r; got[0 .. 4] ~ got[5]) {
+        enforce(r.header("Content-Length") is null && r.header("Content-Type") is null
+            && r.header("Transfer-Encoding") is null && r.content.length == 0, r.head ~ r.content);
+    }
+    enforce(got[4].header("Content-Length") == "0" && got[4].header("Content-Type") == "application/json", got[4].head);
+    enforce(got[6].header("Content-Type").startsWith("multipart/form-data") && !got[6].content.canFind("stale"),
+        got[6].head ~ got[6].content);
+
+    // Answers to keep the connection and then closes it, as on an idle timeout.
+    auto closing = new ScriptedServer((Socket c, ScriptedServer s) {
+        c.send("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok");
+        s.pause(100.msecs);
+    });
+    scope (exit) closing.stop();
+    auto kept = client();
+    kept.keepAlive = true;
+    immutable closingUrl = "http://127.0.0.1:%d/".format(closing.port);
+    enforce(kept.execute("GET", closingUrl, "", "application/json").code == 200);
+    enforce(kept.execute("GET", closingUrl, "", "application/json").code == 200);
+    enforce(atomicLoad(closing.served) == 2);
+}
+
 @("a multipart form sends each part, from memory or a file, with its name, file name and type")
 unittest {
     import std.file : remove, tempDir, write;

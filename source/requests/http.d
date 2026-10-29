@@ -1193,8 +1193,11 @@ public struct HTTPRequest {
         string[] partHeads;  /// ditto, the head of each part
     }
 
-    /// Whether `method` sends the parameters as a form in the body rather than in the query.
-    private static bool sendsForm(string method) pure @safe {
+    /**
+     * Whether `method` defines a meaning for content (RFC 9110, 9.3): it sends the parameters as a form in the body
+     * rather than in the query, and an empty body as `Content-Length: 0` rather than as no body (RFC 9110, 8.6).
+     */
+    private static bool anticipatesContent(string method) pure @safe {
         return ["POST", "PUT", "PATCH"].canFind(method);
     }
 
@@ -1214,7 +1217,7 @@ public struct HTTPRequest {
         QueryParam[] query;
         final switch ( _payload ) {
             case Payload.params:
-                if ( sendsForm(_method) ) {
+                if ( anticipatesContent(_method) ) {
                     o.form = params2query(_params);
                     safeSetHeader(h, _userHeaders.ContentType, "Content-Type", "application/x-www-form-urlencoded");
                     safeSetHeader(h, _userHeaders.ContentLength, "Content-Length", to!string(o.form.length));
@@ -1487,7 +1490,9 @@ public struct HTTPRequest {
 
         debug(requests) trace("serving %s".format(r));
         _deadlineAt = limitEnd(MonoTime.currTime, _deadline, MonoTime.max);
-        _payload = !_postData.empty ? Payload.range : r.hasMultipartForm ? Payload.multipart : Payload.params;
+        // An empty body is no body to a method that gives content no meaning.
+        immutable content = !_postData.empty && (_postData.length != 0 || anticipatesContent(_method));
+        _payload = content ? Payload.range : r.hasMultipartForm ? Payload.multipart : Payload.params;
         _history.length = 0;
         _origin = _uri;
         _leftOrigin = false;
@@ -1549,7 +1554,7 @@ public struct HTTPRequest {
                 _payload = Payload.params;
                 _params = null;
                 _bodyDropped = true;
-            } else if ( !sendsForm(_method) ) {
+            } else if ( !anticipatesContent(_method) ) {
                 // They went into the query, and the location is the whole target.
                 _params = null;
             }

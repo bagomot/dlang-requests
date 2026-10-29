@@ -657,6 +657,7 @@ public struct Request {
         _uri = URI(url);
         _uri.idn_encode();
         _params = null;
+        _postData = InputRangeAdapter.init;
         _multipartForm = form;
 
         // https://issues.dlang.org/show_bug.cgi?id=10535
@@ -681,6 +682,7 @@ public struct Request {
         _uri = URI(url);
         _uri.idn_encode();
         _multipartForm = MultipartForm.init;
+        _postData = InputRangeAdapter.init;
         _params = params;
 
         // https://issues.dlang.org/show_bug.cgi?id=10535
