@@ -31,11 +31,6 @@ public enum size_t defaultMaxContentLength = 64 * 1024 * 1024;
 enum   HTTP11 = 101;
 enum   HTTP10 = 100;
 
-public class MaxRedirectsException: Exception {
-    this(string message, string file = __FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
-        super(message, file, line, next);
-    }
-}
 
 /// What a request sends after its head.
 private enum Payload {
@@ -325,6 +320,9 @@ public struct HTTPRequest {
         bool           _useStreaming;                   // return iterator instead of completed request
 
         HTTPResponse[] _history;                        // redirects history
+        URI            _origin;                         // the URL asked for
+        bool           _leftOrigin;                     // whether a redirect has left the origin of `_origin`
+        bool           _bodyDropped;                    // whether a redirect has dropped the body of the request
         Incoming       _incoming;                       // the response to the current attempt, null before it is sent
         MonoTime       _deadlineAt;
         Payload        _payload;
@@ -513,28 +511,34 @@ public struct HTTPRequest {
 
         string[string] generatedHeaders;
 
-        if ( _authenticator ) {
+        // Credentials go only to the origin of the URL asked for, and stop once a redirect has left it: from
+        // elsewhere a server could send them to any path of the origin. The caller's Host is for that origin too.
+        if ( _authenticator && !_leftOrigin ) {
             _authenticator.
                 authHeaders(_uri.host).
                 byKeyValue.
                 each!(pair => generatedHeaders[pair.key] = pair.value);
         }
-
-        _headers.byKey.each!(h => generatedHeaders[h] = _headers[h]);
+        foreach ( name, value; _headers ) {
+            immutable lower = name.toLower;
+            if ( _leftOrigin && ["authorization", "proxy-authorization", "cookie", "host"].canFind(lower) ) {
+                continue;
+            }
+            if ( _bodyDropped && ["content-length", "content-type", "transfer-encoding"].canFind(lower) ) {
+                continue;
+            }
+            generatedHeaders[name] = value;
+        }
 
         safeSetHeader(generatedHeaders, _userHeaders.AcceptEncoding, "Accept-Encoding", "gzip,deflate");
         safeSetHeader(generatedHeaders, _userHeaders.UserAgent, "User-Agent", "dlang-requests");
         safeSetHeader(generatedHeaders, _userHeaders.Connection, "Connection", _keepAlive?"Keep-Alive":"Close");
 
-        if ( !_userHeaders.Host )
-        {
-            generatedHeaders["Host"] = _uri.bracketedHost;
-            if ( _uri.scheme !in standard_ports || _uri.port != standard_ports[_uri.scheme] ) {
-                generatedHeaders["Host"] ~= ":%d".format(_uri.port);
-            }
+        if ( !_userHeaders.Host || _leftOrigin ) {
+            generatedHeaders["Host"] = _uri.authority;
         }
 
-        if ( _cookie._array.length && !_userHeaders.Cookie ) {
+        if ( _cookie._array.length && (!_userHeaders.Cookie || _leftOrigin) ) {
             auto cs = _cookie._array.
                 filter!(c => _uri.path.pathMatches(c.path) && _uri.host.domainMatches(c.domain)).
                 map!(c => "%s=%s".format(c.attr, c.value)).
@@ -803,16 +807,33 @@ public struct HTTPRequest {
         }
         return true;
     }
-    private URI uriFromLocation(const ref URI uri, in string location) {
-        URI newURI = uri;
+    /**
+     * Where `location`, from a redirect of the request for `base`, points. Throws `RequestCause.redirect` when the
+     * request doesn't go there: to another scheme than http and https, from https to http, or to what is not a URI.
+     */
+    private URI redirectTarget(const URI base, string location) {
+        URI next;
         try {
-            newURI = URI(location);
+            next = base.resolve(location);
         } catch (UriException e) {
-            debug(requests) trace("Can't parse Location:, try relative uri");
-            newURI.path = location;
-            newURI.uri = newURI.recalc_uri;
+            throw responseFailure(RequestCause.redirect, "the redirect can't be followed: " ~ e.msg, e);
         }
-        return newURI;
+        try {
+            next.idn_encode();
+        } catch (Exception e) {
+            throw responseFailure(RequestCause.redirect, "the redirect is to a host name that can't be encoded", e);
+        }
+        if ( base.scheme == "https" && next.scheme == "http" ) {
+            throw responseFailure(RequestCause.redirect, "a redirect from https to http is not followed");
+        }
+        return next;
+    }
+    /// Moves the request to `next`, noting when it leaves the origin of the URL asked for.
+    private void follow(URI next) {
+        if ( next.scheme != _origin.scheme || next.host != _origin.host || next.port != _origin.port ) {
+            _leftOrigin = true;
+        }
+        _uri = next;
     }
     /// The limits of the current request on its connection.
     private NetworkLimits limits() const {
@@ -918,7 +939,7 @@ public struct HTTPRequest {
                     throw failure(ConnectCause.reset, "proxy CONNECT: " ~ e.msg, e);
                 case RequestCause.closed:
                     throw failure(ConnectCause.closed, "proxy CONNECT: " ~ e.msg, e);
-                case RequestCause.protocol, RequestCause.limit, RequestCause.invalid:
+                case RequestCause.protocol, RequestCause.limit, RequestCause.invalid, RequestCause.redirect:
                     throw failure(ConnectCause.protocol, "proxy CONNECT: " ~ e.msg, e);
             }
         }
@@ -1327,6 +1348,9 @@ public struct HTTPRequest {
         _deadlineAt = limitEnd(MonoTime.currTime, _deadline, MonoTime.max);
         _payload = !_postData.empty ? Payload.range : r.hasMultipartForm ? Payload.multipart : Payload.params;
         _history.length = 0;
+        _origin = _uri;
+        _leftOrigin = false;
+        _bodyDropped = false;
         _response = new HTTPResponse;
         _response.uri = _uri;
         _response.finalURI = _uri;
@@ -1334,7 +1358,7 @@ public struct HTTPRequest {
         for (;;) {
             if ( _payload == Payload.params && _method == "GET" && _uri in _permanent_redirects ) {
                 debug(requests) trace("use parmanent redirects cache");
-                _uri = uriFromLocation(_uri, _permanent_redirects[_uri]);
+                follow(redirectTarget(_uri, _permanent_redirects[_uri]));
                 _response._finalURI = _uri;
             }
 
@@ -1364,36 +1388,34 @@ public struct HTTPRequest {
             }
             debug(requests) trace("going to follow redirect");
             if ( _history.length >= _maxRedirects ) {
-                throw new MaxRedirectsException("%d redirects reached maxRedirects %d.".format(_history.length, _maxRedirects));
+                throw responseFailure(RequestCause.redirect, "%d redirects reached maxRedirects".format(_history.length));
             }
             // "location" in response already checked in canFollowRedirect
             immutable new_location = *("location" in _response.responseHeaders);
             immutable current_uri = _uri;
-            immutable next_uri = uriFromLocation(_uri, new_location);
-
-            immutable get_or_head = _method == "GET" || _method == "HEAD";
+            immutable next_uri = redirectTarget(_uri, new_location);
             immutable code = _response.code;
+
+            // 301, 302 and 303 turn a request other than GET and HEAD into a GET, and these send no body.
+            if ( _method != "GET" && _method != "HEAD" && (code == 301 || code == 302 || code == 303) ) {
+                _method = "GET";
+            }
+            immutable keepsBody = _method != "GET" && _method != "HEAD";
+            if ( keepsBody && _payload != Payload.params ) {
+                throw responseFailure(RequestCause.redirect, "the redirect would send the body again, which can be read only once");
+            }
+            if ( !keepsBody ) {
+                _payload = Payload.params;
+                _params = null;
+                _bodyDropped = true;
+            } else if ( !sendsForm(_method) ) {
+                // They went into the query, and the location is the whole target.
+                _params = null;
+            }
 
             // save current response for history
             _history ~= _response;
-
-            if ( code == 301 )
-            {
-                // permanent redirect and change method
-                _permanent_redirects[_uri] = new_location;
-                if ( !get_or_head )
-                {
-                    _method = "GET";
-                }
-            }
-            if ( (code == 302 || code == 303) && !get_or_head)
-            {
-                // only change method
-                _method = "GET";
-            }
-            if ( code == 308 )
-            {
-                // permanent redirection and do not change method
+            if ( code == 301 || code == 308 ) {
                 _permanent_redirects[_uri] = new_location;
             }
 
@@ -1402,13 +1424,8 @@ public struct HTTPRequest {
             _response.uri = current_uri;
             _response.finalURI = next_uri;
 
-            // set new uri
-            _uri = next_uri;
+            follow(next_uri);
             debug(requests) tracef("Redirected to %s", next_uri);
-            if ( _method == "GET" ) {
-                // GET sends no body
-                _payload = Payload.params;
-            }
         }
     }
 }

@@ -84,6 +84,9 @@ public enum RequestCause {
     closed,    /// the peer closed the connection before the response was complete
     protocol,  /// the response is malformed: status line, headers, chunked or compressed body
     limit,     /// the response is longer than `maxHeadersLength` or `maxContentLength`
+    /// the request doesn't follow the redirect: past `maxRedirects`, to another scheme than http and https, from https
+    /// to http, to what is not a URI, or keeping a body that can be read only once
+    redirect,
 }
 
 /// A response body that can't be decoded, or is longer than allowed.

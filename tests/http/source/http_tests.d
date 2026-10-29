@@ -236,7 +236,7 @@ unittest {
     info("Check maxredirects");
     rq.maxRedirects = 2;
     rq.keepAlive = false;
-    assertThrown!MaxRedirectsException(rq.get(httpbinUrl ~ "absolute-redirect/3"));
+    assert(collectException!RequestException(rq.get(httpbinUrl ~ "absolute-redirect/3")).cause == RequestCause.redirect);
 
     rq.maxRedirects = 0;
     rs = rq.get(httpbinUrl ~ "absolute-redirect/1");
