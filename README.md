@@ -16,7 +16,8 @@ A hard fork of [ikod/dlang-requests](https://github.com/ikod/dlang-requests), an
   - `deadline` (none): the whole request, redirects and a streamed body included;
   - `lowSpeedLimit` and `lowSpeedTime` (off): fail a transfer that receives fewer bytes a second over that time, a streamed body included.
 - Failures are typed. `ConnectError` tells the `stage` of setting up the connection (`resolve`, `tcp`, `proxyConnect`, `tlsHandshake`) and the `cause` (`timeout`, `refused`, `reset`, `certificate`, ...); `RequestException` any other failure: its `cause` (`invalid`, `timeout`, `deadline`, `lowSpeed`, `reset`, `closed`, `protocol`, `limit`, `redirect`) and how many `bytesReceived` of the response arrived. Both carry the request's `host`, and their messages carry no host names or addresses. Nothing else escapes a request: `TimeoutException` and `MaxRedirectsException` are gone.
-- A request that can't be sent as it is fails with `RequestCause.invalid` before any connection: a method or header name that is not a token, a header value with a control character other than HTAB, a target with a control character or a space.
+- A request that can't be sent as it is fails with `RequestCause.invalid` before any connection: a method or header name that is not a token, a header value with a control character other than HTAB, a target with a control character or a space, a multipart part whose name or a parameter's value holds a quote, a backslash or a control character, or a parameter whose name is not a token; the part's `Content-Type`, on a line of its own, may hold quotes and backslashes but no control character, and there may be one of it, whatever the case of its name.
+- A body is an array of `ubyte`, `byte` or `char`, sent with its `Content-Length`, a string too, or an input range of such arrays, sent in chunks; nothing else compiles. The parameters of a multipart part, such as `filename`, go in quotes. A caller's `Accept-Encoding` replaces the default `gzip,deflate`; only `gzip`, `x-gzip`, `deflate` and `identity` are decoded, and a response in another coding fails with `RequestCause.protocol`.
 - Responses are parsed strictly (RFC 9112): a control character in the head, a malformed status or header line, `Transfer-Encoding` other than `chunked` or together with `Content-Length`, a `Content-Length` that is not one number, or a malformed chunk fails the request with `RequestCause.protocol`. Interim 1xx responses are skipped, and all the heads together are bound by `maxHeadersLength`, trailer fields included. Bytes past the end of a response are dropped with the connection.
 - A connection that closes before the end of the response, by its `Content-Length` or chunks, fails the request with `RequestCause.closed` rather than returning a short body or code 0. A body without either is read until the connection closes, streamed or not.
 - `maxContentLength` (64 MiB, zero for none) bounds the body both as sent, its chunks decoded, and decompressed, a streamed body too.
@@ -29,7 +30,7 @@ A hard fork of [ikod/dlang-requests](https://github.com/ikod/dlang-requests), an
 - The environment's `http_proxy`, `https_proxy` and `all_proxy` are used only with `useEnvironmentProxy`; a null `proxy` connects directly.
 - On Linux a write to a TLS connection the peer has closed doesn't raise SIGPIPE: it is blocked in the writing thread meanwhile, and the process's handler is left alone.
 - An interceptor may call `next.handle` more than once.
-- Removed: OpenSSL 1.x and LibreSSL, the `staticssl` configuration, vibe.d support, the FTP client, the request pool, `SSLKEYLOGFILE` support, the deprecated `HTTPRequest.exec`, packaging and generated docs. The test HTTP server is no longer part of the library.
+- Removed: OpenSSL 1.x and LibreSSL, the `staticssl` configuration, vibe.d support, the FTP client, the request pool, `SSLKEYLOGFILE` support, the deprecated `HTTPRequest.exec` with `PostFile`, the server side of `NetworkStream`, upstream's test HTTP server, packaging and generated docs.
 
 ## Build
 
@@ -47,16 +48,23 @@ The `openssl-static` configuration, for Windows and Linux, takes OpenSSL from th
 
 ## Test
 
-No test talks to anything outside the machine.
+No test talks to anything outside the machine. They run with LDC and dub, the network tests with OpenSSL 3 or 4.
 
 ```
 dub test                    # unit tests of the library
-cd tests/http && dub test   # requests against a local HTTP server
-cd tests/net && dub test    # TLS, connection set-up, time limits, errors, redirects, response parsing and limits,
-                            # request checks, cookies and traces, against local servers and proxies
+cd tests/net && dub test    # what requests send and make of responses, TLS, connection set-up, time limits,
+                            # errors, redirects, response parsing and limits, request checks, cookies and traces,
+                            # against local servers and proxies
 ```
 
-The network tests print the OpenSSL version they run with. On Windows, put the OpenSSL DLLs into `tests/net` before running them. With `dub test --debug=requests` they check the traces too. To run them with OpenSSL linked statically, point `OPENSSL_LIB_DIR` at the directory of the static libraries; on Linux this configuration also links the system libcurl:
+The network tests print the OpenSSL version they run with, then `ok` or `FAIL` and the reason for each test, and how many passed; the run fails unless all did. With `dub test --debug=requests` they check the traces too. Their servers listen on 127.0.0.1, and on ::1 where there is one; a test connects from 127.0.0.2.
+
+Any x64 build of OpenSSL 3 or 4 will do: a shared one for the default configuration, where the system has none, and a `no-shared` one for the static configuration (see Build). In the default configuration the network tests take OpenSSL as the library does:
+
+- Windows: put `libssl-3-x64.dll` and `libcrypto-3-x64.dll`, or the `-4-` ones, into `tests/net`, next to the test executable. A test runs a copy of the executable elsewhere, with the DLLs in its current directory and on `PATH`, to check that it loads none of them;
+- Linux: the system's `libssl.so.3` or `libssl.so.4`; for another build, put its directory into `LD_LIBRARY_PATH`.
+
+To run them with OpenSSL linked statically, point `OPENSSL_LIB_DIR` at the directory of the static libraries (`set OPENSSL_LIB_DIR=<dir>` in `cmd`); on Linux this configuration also links the system libcurl, to check that the two copies of OpenSSL keep apart:
 
 ```
 cd tests/net && OPENSSL_LIB_DIR=<dir> dub test -c openssl-static
