@@ -24,7 +24,8 @@ import core.sync.mutex : Mutex;
 import core.thread : Thread;
 import core.time : MonoTime;
 
-import requests.ssl_adapter : openssl, OpenSSL, SSL, SSL_CTX, X509_V_OK, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS;
+import requests.ssl_adapter : openssl, OpenSSL, SSL, SSL_CTX, TLS1_2_VERSION, X509_V_OK,
+    X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS;
 
 alias InDataHandler = DataPipeIface!ubyte;
 
@@ -1232,6 +1233,9 @@ private final class TlsSession {
             throw failedSetUp(host, "can't create a TLS context");
         }
         scope(failure) free();
+        if ( api.SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) != 1 ) {
+            throw failedSetUp(host, "can't require TLS 1.2 or newer");
+        }
         verifyPeer = opts.getVerifyPeer();
         if ( verifyPeer ) {
             if ( opts.getCaCert() ) {
@@ -1295,7 +1299,7 @@ private final class TlsSession {
 
     /**
      * Sets the name sent in SNI and, when the peer is verified, the name its certificate must carry:
-     * a DNS name, or an IP address matched against the certificate's IP entries.
+     * a DNS name in its subjectAltName, never its subject's CN, or an IP address matched against its IP entries.
      */
     private void setPeerName(string host) {
         if ( host is null ) {
@@ -1311,7 +1315,7 @@ private final class TlsSession {
             if ( ip ) {
                 rc = api.X509_VERIFY_PARAM_set1_ip_asc(param, host.toStringz());
             } else {
-                api.X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+                api.X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS | X509_CHECK_FLAG_NEVER_CHECK_SUBJECT);
                 rc = api.X509_VERIFY_PARAM_set1_host(param, host.toStringz(), 0);
             }
             if ( rc != 1 ) {

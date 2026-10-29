@@ -20,6 +20,8 @@ struct X509_VERIFY_PARAM;
 
 enum c_long X509_V_OK = 0;
 enum uint X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS = 0x4;
+enum uint X509_CHECK_FLAG_NEVER_CHECK_SUBJECT = 0x20;
+enum int TLS1_2_VERSION = 0x0303;
 
 /// Thrown by the first use of TLS when OpenSSL can't be loaded, isn't a supported version or fails to initialize.
 public class OpenSSLUnavailableException : Exception {
@@ -39,6 +41,7 @@ private extern (C) nothrow @nogc {
     const(SSL_METHOD)* TLS_client_method();
     SSL_CTX* SSL_CTX_new(const(SSL_METHOD)* method);
     void SSL_CTX_free(SSL_CTX* ctx);
+    c_long SSL_CTX_ctrl(SSL_CTX* ctx, int cmd, c_long larg, void* parg);
     int SSL_CTX_set_default_verify_paths(SSL_CTX* ctx);
     int SSL_CTX_load_verify_locations(SSL_CTX* ctx, const(char)* caFile, const(char)* caPath);
     void SSL_CTX_set_verify(SSL_CTX* ctx, int mode, void* callback);
@@ -74,6 +77,7 @@ private enum libsslFunctions = [
     "TLS_client_method",
     "SSL_CTX_new",
     "SSL_CTX_free",
+    "SSL_CTX_ctrl",
     "SSL_CTX_set_default_verify_paths",
     "SSL_CTX_load_verify_locations",
     "SSL_CTX_set_verify",
@@ -127,6 +131,11 @@ struct OpenSSL {
 
     static foreach (name; libsslFunctions ~ libcryptoFunctions) {
         mixin("typeof(&." ~ name ~ ") " ~ name ~ ";");
+    }
+
+    int SSL_CTX_set_min_proto_version(SSL_CTX* ctx, int version_) const @nogc nothrow {
+        enum SSL_CTRL_SET_MIN_PROTO_VERSION = 123;
+        return cast(int) SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, version_, null);
     }
 
     c_long SSL_set_tlsext_host_name(SSL* ssl, const(char)* host) const @nogc nothrow {
