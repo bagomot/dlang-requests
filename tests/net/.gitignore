@@ -5,4 +5,4 @@
 *.pdb
 *.lib
 *.a
-tls-tests-test-*
+net-tests-test-*
