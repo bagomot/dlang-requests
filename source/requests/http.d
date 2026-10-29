@@ -549,32 +549,25 @@ public struct HTTPRequest {
 
         return generatedHeaders;
     }
-    ///
-    /// Build request string.
-    /// Handle proxy and query parameters.
-    ///
-    private @property string requestString(QueryParam[] params = null) {
-        auto query = _uri.query.dup;
-        if ( params ) {
-            query ~= params2query(params);
-            if ( query[0] != '?' ) {
-                query = "?" ~ query;
-            }
+    /// The request target: the path and the query with `params`, or for an http request through a proxy the absolute URI.
+    private string requestTarget(QueryParam[] params = null) {
+        string query = _uri.query;
+        if ( params.length ) {
+            query ~= (query.length ? "&" : "?") ~ params2query(params);
         }
-        string actual_proxy = select_proxy(_uri.scheme);
-        if ( actual_proxy && _uri.scheme != "https" ) {
-            return "%s %s%s HTTP/1.1\r\n".format(_method, _uri.uri(No.params), query);
+        if ( select_proxy(_uri.scheme) && _uri.scheme != "https" ) {
+            return _uri.uri(No.params) ~ query;
         }
-        return "%s %s%s HTTP/1.1\r\n".format(_method, _uri.path, query);
+        return _uri.path ~ query;
     }
 
     unittest {
         HTTPRequest request;
         request._uri = URI("https://www.blub.de/");
-        import std.stdio;
-        auto expected = "GET /?a=b&c=d HTTP/1.1\r\n";
-        auto actual = request.requestString([QueryParam("a", "b"), QueryParam("c", "d")]);
-        assert(expected == actual, "Expected\n  '%s' but got\n  '%s'".format(expected, actual));
+        assert(request.requestTarget([QueryParam("a", "b"), QueryParam("c", "d")]) == "/?a=b&c=d");
+        request._uri = URI("https://www.blub.de/p?x=1");
+        assert(request.requestTarget([QueryParam("a", "b")]) == "/p?x=1&a=b");
+        assert(request.requestTarget() == "/p?x=1");
     }
 
     ///
@@ -925,7 +918,7 @@ public struct HTTPRequest {
                     throw failure(ConnectCause.reset, "proxy CONNECT: " ~ e.msg, e);
                 case RequestCause.closed:
                     throw failure(ConnectCause.closed, "proxy CONNECT: " ~ e.msg, e);
-                case RequestCause.protocol, RequestCause.limit:
+                case RequestCause.protocol, RequestCause.limit, RequestCause.invalid:
                     throw failure(ConnectCause.protocol, "proxy CONNECT: " ~ e.msg, e);
             }
         }
@@ -1073,156 +1066,175 @@ public struct HTTPRequest {
 
     import requests.request;
 
-    // we use this if we send from ubyte[][] and user provided Content-Length
-    private void sendFlattenContent(NetworkStream _stream) {
-        while ( !_postData.empty ) {
-            auto chunk = _postData.front;
-            _stream.send(chunk);
-            _postData.popFront;
-        }
-        debug(requests) tracef("sent");
-    }
-    // we use this if we send from ubyte[][] as chunked content
-    private void sendChunkedContent(NetworkStream _stream) {
-        while ( !_postData.empty ) {
-            auto chunk = _postData.front;
-            auto chunkHeader = "%x\r\n".format(chunk.length);
-            debug(requests) tracef("sending %s%s", chunkHeader, cast(string)chunk);
-            _stream.send(chunkHeader);
-            _stream.send(chunk);
-            _stream.send("\r\n");
-            debug(requests) tracef("chunk sent");
-            _postData.popFront;
-        }
-        debug(requests) tracef("sent");
-        _stream.send("0\r\n\r\n");
+    /// A request ready to go: its head, and how its body follows.
+    private struct Outgoing {
+        string   head;       /// the request line and the header fields, up to the empty line
+        string   form;       /// with `Payload.params`, the form that is the body
+        bool     chunked;    /// with `Payload.range`, whether the data goes in chunks
+        string   boundary;   /// with `Payload.multipart`, the boundary between the parts
+        string[] partHeads;  /// ditto, the head of each part
     }
 
-    /// Sends the head; `params` go into the query.
-    private void sendHead(NetworkStream _stream, string[string] h, QueryParam[] params = null) {
-        Appender!string req;
-        req.put(requestString(params));
-        h.byKeyValue.
-            map!(kv => kv.key ~ ": " ~ kv.value ~ "\r\n").
-            each!(h => req.put(h));
-        req.put("\r\n");
-        debug(requests) trace(req.data);
-        if ( _verbosity >= 1 ) {
-            req.data.splitLines.each!(a => writeln("> " ~ a));
-        }
-        _stream.send(req.data());
+    /// Whether `method` sends the parameters as a form in the body rather than in the query.
+    private static bool sendsForm(string method) pure @safe {
+        return ["POST", "PUT", "PATCH"].canFind(method);
     }
 
-    /// Sends the request with the parameters: as a form for POST, PUT and PATCH, in the query otherwise.
-    private void sendParams(NetworkStream _stream) {
+    /// The exception for a request that can't be sent as it is.
+    private RequestException invalid(string message) {
+        return new RequestException(RequestCause.invalid, _uri.host, 0, message);
+    }
+
+    /**
+     * Composes the request for `_uri`, before any connection. Throws `RequestCause.invalid` when it can't be sent as it
+     * is: the method or a header name is not a token, a header value holds a control character, or the target a
+     * control character or a space.
+     */
+    private Outgoing compose() {
+        Outgoing o;
         auto h = requestHeaders();
-        switch (_method) {
-            case "POST","PUT","PATCH":
-                immutable encoded = params2query(_params);
-                safeSetHeader(h, _userHeaders.ContentType, "Content-Type", "application/x-www-form-urlencoded");
-                safeSetHeader(h, _userHeaders.ContentLength, "Content-Length", to!string(encoded.length));
-                sendHead(_stream, h);
-                if ( encoded.length ) {
-                    _stream.send(encoded);
+        QueryParam[] query;
+        final switch ( _payload ) {
+            case Payload.params:
+                if ( sendsForm(_method) ) {
+                    o.form = params2query(_params);
+                    safeSetHeader(h, _userHeaders.ContentType, "Content-Type", "application/x-www-form-urlencoded");
+                    safeSetHeader(h, _userHeaders.ContentLength, "Content-Length", to!string(o.form.length));
+                } else {
+                    query = _params;
                 }
                 break;
-            default:
-                sendHead(_stream, h, _params);
+            case Payload.range:
+                if ( _contentType ) {
+                    safeSetHeader(h, _userHeaders.ContentType, "Content-Type", _contentType);
+                }
+                if ( _postData.length >= 0 ) {
+                    safeSetHeader(h, _userHeaders.ContentLength, "Content-Length", to!string(_postData.length));
+                }
+                o.chunked = !_userHeaders.ContentLength && "Content-Length" !in h;
+                if ( o.chunked ) {
+                    h["Transfer-Encoding"] = "chunked";
+                }
+                break;
+            case Payload.multipart:
+                composeMultipart(o, h);
+                break;
         }
+        if ( !isToken(_method) ) {
+            throw invalid("the method is not a token");
+        }
+        immutable target = requestTarget(query);
+        if ( target.representation.any!(c => c <= 0x20 || c == 0x7F) ) {
+            throw invalid("the request target holds a control character or a space");
+        }
+        foreach ( name, value; h ) {
+            if ( !isToken(name) ) {
+                throw invalid("a header name is not a token");
+            }
+            if ( hasControl(value) ) {
+                throw invalid("the value of header %s holds a control character".format(name));
+            }
+        }
+        Appender!string head;
+        head.put("%s %s HTTP/1.1\r\n".format(_method, target));
+        h.byKeyValue.each!(kv => head.put(kv.key ~ ": " ~ kv.value ~ "\r\n"));
+        head.put("\r\n");
+        o.head = head.data;
+        return o;
     }
 
-    /// Sends the request with the data of `_postData`: with Content-Length when its length is known, chunked otherwise.
-    private void sendRange(NetworkStream _stream) {
-        auto h = requestHeaders;
-        if ( _contentType ) {
-            safeSetHeader(h, _userHeaders.ContentType, "Content-Type", _contentType);
-        }
-
-        if ( _postData.length >= 0 )
-        {
-            // we know t
-            safeSetHeader(h, _userHeaders.ContentLength, "Content-Length", to!string(_postData.length));
-        }
-
-        bool send_flat;
-        if ( _userHeaders.ContentLength || "Content-Length" in h )
-        {
-            debug(requests) tracef("User provided content-length for chunked content");
-            send_flat = true;
-        }
-        else
-        {
-            h["Transfer-Encoding"] = "chunked";
-            send_flat = false;
-        }
-        sendHead(_stream, h);
-        if ( send_flat ) {
-            sendFlattenContent(_stream);
-        } else {
-            sendChunkedContent(_stream);
-        }
-    }
-
-    /// Sends the request with `_multipartForm`.
-    private void sendMultipart(NetworkStream _stream) {
+    /// Composes the parts of `_multipartForm` into `o`, and their headers into `h`.
+    private void composeMultipart(ref Outgoing o, ref string[string] h) {
         import std.uuid;
 
-        string   boundary = randomUUID().toString;
-        string[] partHeaders;
-        size_t   contentLength;
-
-        foreach(ref part; _multipartForm._sources) {
-            string h = "--" ~ boundary ~ "\r\n";
+        o.boundary = randomUUID().toString;
+        size_t contentLength;
+        foreach ( ref part; _multipartForm._sources ) {
+            // The name goes in quotes, and the parameters each on a line of their own.
+            if ( part.name.canFind('"') || hasControl(part.name)
+                    || part.parameters.byKeyValue.any!(p => hasControl(p.key) || hasControl(p.value)) ) {
+                throw invalid("a part of the multipart form has a name or a parameter it can't carry");
+            }
+            string ph = "--" ~ o.boundary ~ "\r\n";
             string disposition = `form-data; name="%s"`.format(part.name);
             string optionals = part.
-            parameters.byKeyValue().
-            filter!(p => p.key!="Content-Type").
-            map!   (p => "%s=%s".format(p.key, p.value)).
-            join("; ");
+                parameters.byKeyValue().
+                filter!(p => p.key!="Content-Type").
+                map!   (p => "%s=%s".format(p.key, p.value)).
+                join("; ");
 
-            h ~= `Content-Disposition: ` ~ [disposition, optionals].join("; ") ~ "\r\n";
-
-            auto contentType = "Content-Type" in part.parameters;
-            if ( contentType ) {
-                h ~= "Content-Type: " ~ *contentType ~ "\r\n";
+            ph ~= `Content-Disposition: ` ~ [disposition, optionals].join("; ") ~ "\r\n";
+            if ( auto contentType = "Content-Type" in part.parameters ) {
+                ph ~= "Content-Type: " ~ *contentType ~ "\r\n";
             }
-
-            h ~= "\r\n";
-            partHeaders ~= h;
-            contentLength += h.length + part.input.getSize() + "\r\n".length;
+            ph ~= "\r\n";
+            o.partHeads ~= ph;
+            contentLength += ph.length + part.input.getSize() + "\r\n".length;
         }
-        contentLength += "--".length + boundary.length + "--\r\n".length;
-
-        auto h = requestHeaders();
-        safeSetHeader(h, _userHeaders.ContentType, "Content-Type", "multipart/form-data; boundary=" ~ boundary);
+        contentLength += "--".length + o.boundary.length + "--\r\n".length;
+        safeSetHeader(h, _userHeaders.ContentType, "Content-Type", "multipart/form-data; boundary=" ~ o.boundary);
         safeSetHeader(h, _userHeaders.ContentLength, "Content-Length", to!string(contentLength));
-        sendHead(_stream, h);
+    }
 
-        foreach(ref source; _multipartForm._sources) {
-            debug(requests) tracef("sending part headers <%s>", partHeaders.front);
-            _stream.send(partHeaders.front);
-            partHeaders.popFront;
-            while (true) {
-                auto chunk = source.input.read();
-                if ( chunk.length <= 0 ) {
-                    break;
-                }
-                _stream.send(chunk);
-            }
-            _stream.send("\r\n");
+    /// Sends `o` on `stream`, its body from `_postData` or `_multipartForm` with those payloads.
+    private void send(NetworkStream stream, ref Outgoing o) {
+        debug(requests) trace(o.head);
+        if ( _verbosity >= 1 ) {
+            o.head.splitLines.each!(a => writeln("> " ~ a));
         }
-        _stream.send("--" ~ boundary ~ "--\r\n");
+        stream.send(o.head);
+        final switch ( _payload ) {
+            case Payload.params:
+                if ( o.form.length ) {
+                    stream.send(o.form);
+                }
+                break;
+            case Payload.range:
+                while ( !_postData.empty ) {
+                    auto chunk = _postData.front;
+                    // An empty chunk would end the body.
+                    if ( !o.chunked ) {
+                        stream.send(chunk);
+                    } else if ( chunk.length ) {
+                        stream.send("%x\r\n".format(chunk.length));
+                        stream.send(chunk);
+                        stream.send("\r\n");
+                    }
+                    _postData.popFront;
+                }
+                if ( o.chunked ) {
+                    stream.send("0\r\n\r\n");
+                }
+                break;
+            case Payload.multipart:
+                foreach ( i, ref source; _multipartForm._sources ) {
+                    stream.send(o.partHeads[i]);
+                    for (;;) {
+                        auto chunk = source.input.read();
+                        if ( chunk.length == 0 ) {
+                            break;
+                        }
+                        stream.send(chunk);
+                    }
+                    stream.send("\r\n");
+                }
+                stream.send("--" ~ o.boundary ~ "--\r\n");
+                break;
+        }
+        debug(requests) tracef("sent");
     }
 
     /**
      * Sends the request over a cached connection or a new one and receives the response. When a cached connection turns
-     * out to be closed before any byte of the response, an idempotent request goes once more over a new one.
+     * out to be closed before any byte of the response, an idempotent request without a body read from a range or a
+     * form's parts, which can be read only once, goes once more over a new one.
      */
     private NetworkStream exchange() {
         bool resent;
         for (;;) {
             _incoming = null;
             _response._startedAt = Clock.currTime;
+            auto outgoing = compose();
 
             immutable proxy = select_proxy(_uri.scheme);
             auto _stream = _cm.get(_uri.scheme, _uri.host, _uri.port, proxy);
@@ -1244,17 +1256,7 @@ public struct HTTPRequest {
             _incoming = new Incoming(_stream, _bufferSize, _verbosity);
 
             try {
-                final switch ( _payload ) {
-                    case Payload.params:
-                        sendParams(_stream);
-                        break;
-                    case Payload.range:
-                        sendRange(_stream);
-                        break;
-                    case Payload.multipart:
-                        sendMultipart(_stream);
-                        break;
-                }
+                send(_stream, outgoing);
                 _response._requestSentAt = Clock.currTime;
                 debug(requests) trace("starting receive response");
                 receiveResponse();
@@ -1267,7 +1269,7 @@ public struct HTTPRequest {
                 _stream.close();
                 if ( auto ne = cast(NetworkException) e ) {
                     // A server may close a kept-alive connection just as the request goes out.
-                    if ( reused && !resent && _incoming.bytes == 0 && isIdempotent(_method)
+                    if ( reused && !resent && _incoming.bytes == 0 && isIdempotent(_method) && _payload == Payload.params
                         && (ne.cause == RequestCause.closed || ne.cause == RequestCause.reset) ) {
                         debug(requests) tracef("Server closed keepalive connection");
                         resent = true;

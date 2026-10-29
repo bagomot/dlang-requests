@@ -74,8 +74,9 @@ public class ConnectError: Exception {
     }
 }
 
-/// Why a request failed after its connection was set up.
+/// Why a request failed other than in setting up its connection.
 public enum RequestCause {
+    invalid,   /// the request can't be sent as it is: a character its method, target or a header may not hold
     timeout,   /// sending or receiving made no progress within the request's `timeout`
     deadline,  /// the request's `deadline` passed
     lowSpeed,  /// receiving stayed below `lowSpeedLimit` bytes a second for `lowSpeedTime`

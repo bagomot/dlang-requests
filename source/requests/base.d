@@ -205,7 +205,8 @@ public struct MultipartForm {
 }
 ///
 
-/// A request failed after its connection was set up: the transfer broke, or the response can't be used.
+/// A request failed other than in setting up its connection: it can't be sent as it is, the transfer broke, or the
+/// response can't be used.
 public class RequestException: Exception {
     immutable RequestCause cause;
     /// The host of the request.
