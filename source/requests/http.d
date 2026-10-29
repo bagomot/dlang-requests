@@ -1118,6 +1118,8 @@ public struct HTTPRequest {
                     throw failure(ConnectCause.closed, "proxy CONNECT: " ~ e.msg, e);
                 case RequestCause.protocol, RequestCause.limit, RequestCause.invalid, RequestCause.redirect:
                     throw failure(ConnectCause.protocol, "proxy CONNECT: " ~ e.msg, e);
+                case RequestCause.local:
+                    throw failure(ConnectCause.local, "proxy CONNECT: " ~ e.msg, e);
             }
         }
         Head h;

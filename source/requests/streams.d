@@ -21,7 +21,7 @@ import core.stdc.config : c_long, c_ulong;
 
 import core.sync.condition : Condition;
 import core.sync.mutex : Mutex;
-import core.thread : Thread;
+import core.thread : Thread, ThreadError;
 import core.time : MonoTime;
 
 import requests.ssl_adapter : openssl, OpenSSL, OpenSSLUnavailableException, SSL, SSL_CTX, TLS1_2_VERSION, X509_V_OK,
@@ -115,6 +115,7 @@ public enum RequestCause {
     /// the request doesn't follow the redirect: past `maxRedirects`, to another scheme than http and https, from https
     /// to http, to what is not a URI, or keeping a body that can be read only once
     redirect,
+    local,     /// a failure on this machine, such as of `select`, after the connection was set up
 }
 
 /// A response body that can't be decoded, or is longer than allowed.
@@ -1147,20 +1148,48 @@ private bool waitReady(Socket s, bool write, MonoTime end) {
         set.reset();
         set.add(s);
         int n;
-        if ( end == MonoTime.max ) {
-            n = Socket.select(write ? null : set, write ? set : null, null);
-        } else {
-            immutable left = end - MonoTime.currTime;
-            if ( left <= Duration.zero ) {
-                return false;
+        try {
+            if ( end == MonoTime.max ) {
+                n = Socket.select(write ? null : set, write ? set : null, null);
+            } else {
+                immutable left = end - MonoTime.currTime;
+                if ( left <= Duration.zero ) {
+                    return false;
+                }
+                n = Socket.select(write ? null : set, write ? set : null, null, left);
             }
-            n = Socket.select(write ? null : set, write ? set : null, null, left);
+        } catch (SocketOSException e) {
+            throw new NetworkException(RequestCause.local, "waiting for the connection failed: " ~ e.msg);
         }
         if ( n > 0 ) {
             return true;
         }
         // 0 is a timeout, which a coarse clock can report a little early; -1 an interrupted wait.
     }
+}
+
+unittest {
+    // A socket whose handle has been closed underneath, on which select fails.
+    auto listener = new TcpSocket(AddressFamily.INET);
+    scope (exit) listener.close();
+    listener.bind(new InternetAddress("127.0.0.1", InternetAddress.PORT_ANY));
+    listener.listen(1);
+    auto client = new TcpSocket(new InternetAddress("127.0.0.1", (cast(InternetAddress) listener.localAddress).port));
+    immutable handle = client.release();
+    version (Windows) {
+        import core.sys.windows.winsock2 : closesocket;
+
+        closesocket(handle);
+    } else {
+        import core.sys.posix.unistd : close;
+
+        close(handle);
+    }
+    auto stale = new Socket(handle, AddressFamily.INET);
+    // Not to close the handle again, which may belong to another socket by then.
+    scope (exit) stale.release();
+    auto e = collectException!NetworkException(waitReady(stale, false, MonoTime.currTime + 1.seconds));
+    assert(e !is null && e.cause == RequestCause.local);
 }
 
 /// Connects non-blocking `s` to `a` by `end`: 0 when connected, -1 when the time ran out, otherwise the OS error.
@@ -1245,7 +1274,11 @@ private Address[] resolve(string host, ushort port, IPFamily family, MonoTime en
         }
     });
     resolver.isDaemon = true;
-    resolver.start();
+    try {
+        resolver.start();
+    } catch (ThreadError e) {
+        throw new ConnectError(ConnectStage.resolve, ConnectCause.local, host, "can't start a thread to resolve the host name");
+    }
     synchronized (lookup.mutex) {
         while ( !lookup.done ) {
             if ( end == MonoTime.max ) {
