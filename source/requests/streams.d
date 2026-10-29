@@ -85,9 +85,13 @@ public enum RequestCause {
     limit,     /// the response is longer than `maxHeadersLength` or `maxContentLength`
 }
 
+/// A response body that can't be decoded, or is longer than allowed.
 package class DecodingException: Exception {
-    this(string message, string file =__FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
+    immutable RequestCause cause;
+
+    this(RequestCause cause, string message, string file =__FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
         super(message, file, line, next);
+        this.cause = cause;
     }
 }
 
@@ -145,15 +149,24 @@ public class DataPipe(E) : DataPipeIface!E {
             buffer.putNoCopy(data);
             return;
         }
-        try {
+        decoding({
             auto t = process(pipe.front, [data]);
             foreach(ref p; pipe[1..$]) {
                 t = process(p, t);
             }
             t.each!(b => buffer.putNoCopy(b));
+        });
+    }
+    /// Runs `step` of the pipeline, telling any failure of a processor as a `DecodingException`.
+    private void decoding(scope void delegate() step) {
+        try {
+            step();
+        }
+        catch (DecodingException e) {
+            throw e;
         }
         catch (Exception e) {
-            throw new DecodingException(e.msg);
+            throw new DecodingException(RequestCause.protocol, e.msg);
         }
     }
     /// Get what was collected in internal buffer and clear it.
@@ -185,14 +198,16 @@ public class DataPipe(E) : DataPipeIface!E {
         return buffer.empty;
     }
     final void flush() {
-        E[][] product;
-        foreach(ref p; pipe) {
-            product.each!(e => p.putNoCopy(e));
-            p.flush();
-            product.length = 0;
-            while( !p.empty ) product ~= p.get();
-        }
-        product.each!(b => buffer.putNoCopy(b));
+        decoding({
+            E[][] product;
+            foreach(ref p; pipe) {
+                product.each!(e => p.putNoCopy(e));
+                p.flush();
+                product.length = 0;
+                while( !p.empty ) product ~= p.get();
+            }
+            product.each!(b => buffer.putNoCopy(b));
+        });
     }
 }
 
@@ -245,115 +260,118 @@ public class Decompressor(E) : DataPipeIface!E {
 }
 
 /**
- * Unchunk chunked http responce body.
+ * Decodes a chunked body (RFC 9112, 7.1). Its trailer fields are read and dropped; bytes after the body make `surplus`.
  */
 public class DecodeChunked : DataPipeIface!ubyte {
-    //    length := 0
-    //    read chunk-size, chunk-extension (if any) and CRLF
-    //    while (chunk-size > 0) {
-    //        read chunk-data and CRLF
-    //        append chunk-data to entity-body
-    //        length := length + chunk-size
-    //        read chunk-size and CRLF
-    //    }
-    //    read entity-header
-    //    while (entity-header not empty) {
-    //        append entity-header to existing header fields
-    //        read entity-header
-    //    }
-    //    Content-Length := length
-    //    Remove "chunked" from Transfer-Encoding
-    //
-
-    //    Chunked-Body   = *chunk
-    //                      last-chunk
-    //                      trailer
-    //                      CRLF
-    //
-    //    chunk          = chunk-size [ chunk-extension ] CRLF
-    //                     chunk-data CRLF
-    //                     chunk-size     = 1*HEX
-    //                     last-chunk     = 1*("0") [ chunk-extension ] CRLF
-    //
-    //    chunk-extension= *( ";" chunk-ext-name [ "=" chunk-ext-val ] )
-    //    chunk-ext-name = token
-    //    chunk-ext-val  = token | quoted-string
-    //    chunk-data     = chunk-size(OCTET)
-    //    trailer        = *(entity-header CRLF)
-
-    alias eType = ubyte;
-    immutable eType[] CRLF = ['\r', '\n'];
-    private {
-        enum         States {huntingSize, huntingSeparator, receiving, trailer};
-        char         state = States.huntingSize;
-        size_t       chunk_size, to_receive;
-        Buffer!ubyte buff;
-        ubyte[]      linebuff;
+    private enum State {
+        size,     /// in the line with the size of the next chunk
+        data,     /// in the data of a chunk
+        dataEnd,  /// in the line end after the data of a chunk
+        trailer,  /// in the trailer fields, after the last chunk
+        done,     /// past the empty line that ends the body
     }
-    final void putNoCopy(eType[] data) {
+    /// The longest line with a chunk size, its extensions included.
+    private enum maxSizeLine = 1024;
+    private {
+        State        state;
+        ulong        left;              // bytes of the current chunk still to come
+        ubyte[]      line;              // the part of the current line received so far
+        size_t       trailerLength;
+        size_t       maxTrailerLength;
+        bool         _surplus;
+        Buffer!ubyte buff;
+    }
+    /// Accepts trailer fields up to `maxTrailerLength` bytes in all.
+    this(size_t maxTrailerLength) {
+        this.maxTrailerLength = maxTrailerLength;
+    }
+    final void putNoCopy(ubyte[] data) {
         while ( data.length ) {
-            if ( state == States.trailer ) {
-                to_receive = to_receive - min(to_receive, data.length);
-                return;
-            }
-            if ( state == States.huntingSize ) {
-                import std.ascii;
-                ubyte[10] digits;
-                int i;
-                for(i=0;i<data.length;i++) {
-                    ubyte v = data[i];
-                    digits[i] = v;
-                    if ( v == '\n' ) {
-                        i+=1;
-                        break;
+            final switch ( state ) {
+                case State.data:
+                    immutable take = cast(size_t)min(left, data.length);
+                    buff.putNoCopy(data[0 .. take]);
+                    data = data[take .. $];
+                    left -= take;
+                    if ( left == 0 ) {
+                        state = State.dataEnd;
                     }
-                }
-                linebuff ~= digits[0..i];
-                if ( linebuff.length >= 80 ) {
-                    throw new DecodingException("Can't find chunk size in the body");
-                }
-                data = data[i..$];
-                if (!linebuff.canFind(CRLF)) {
-                    continue;
-                }
-                chunk_size = linebuff.filter!isHexDigit.map!toUpper.map!"a<='9'?a-'0':a-'A'+10".reduce!"a*16+b";
-                state = States.receiving;
-                to_receive = chunk_size;
-                if ( chunk_size == 0 ) {
-                    to_receive = 2-min(2, data.length); // trailing \r\n
-                    state = States.trailer;
+                    break;
+                case State.done:
+                    _surplus = true;
                     return;
-                }
-                continue;
-            }
-            if ( state == States.receiving ) {
-                if (to_receive > 0 ) {
-                    auto can_store = min(to_receive, data.length);
-                    buff.putNoCopy(data[0..can_store]);
-                    data = data[can_store..$];
-                    to_receive -= can_store;
-                    //tracef("Unchunked %d bytes from %d", can_store, chunk_size);
-                    if ( to_receive == 0 ) {
-                        //tracef("switch to huntig separator");
-                        state = States.huntingSeparator;
-                        continue;
+                case State.size:
+                case State.dataEnd:
+                case State.trailer:
+                    immutable lf = data.countUntil('\n');
+                    line ~= lf < 0 ? data : data[0 .. lf];
+                    data = lf < 0 ? data[$ .. $] : data[lf + 1 .. $];
+                    if ( state == State.trailer ? trailerLength + line.length > maxTrailerLength : line.length > maxSizeLine ) {
+                        throw new DecodingException(state == State.trailer ? RequestCause.limit : RequestCause.protocol,
+                            state == State.trailer ? "the trailer fields are longer than maxHeadersLength" : "a chunk size line is too long");
                     }
-                    continue;
-                }
-                assert(false);
-            }
-            if ( state == States.huntingSeparator ) {
-                if ( data[0] == '\n' || data[0]=='\r') {
-                    data = data[1..$];
-                    continue;
-                }
-                state = States.huntingSize;
-                linebuff.length = 0;
-                continue;
+                    if ( lf < 0 ) {
+                        return;
+                    }
+                    // A line ends with LF; a CR before it is dropped (RFC 9112, 2.2).
+                    auto l = line.length && line[$ - 1] == '\r' ? line[0 .. $ - 1] : line;
+                    line = null;
+                    endOfLine(l);
+                    break;
             }
         }
     }
-    final eType[] get() {
+    private void endOfLine(const(ubyte)[] l) {
+        final switch ( state ) {
+            case State.size:
+                left = chunkSize(l);
+                state = left == 0 ? State.trailer : State.data;
+                break;
+            case State.dataEnd:
+                if ( l.length ) {
+                    throw new DecodingException(RequestCause.protocol, "a chunk's data is not followed by a line end");
+                }
+                state = State.size;
+                break;
+            case State.trailer:
+                if ( l.length == 0 ) {
+                    state = State.done;
+                }
+                trailerLength += l.length + 2;
+                break;
+            case State.data:
+            case State.done:
+                assert(false);
+        }
+    }
+    /// The size in chunk size line `l`: hexadecimal digits, then its end or extensions after `;`.
+    private static ulong chunkSize(const(ubyte)[] l) pure @safe {
+        import std.ascii : isHexDigit;
+        size_t digits;
+        while ( digits < l.length && isHexDigit(l[digits]) ) {
+            digits++;
+        }
+        auto rest = l[digits .. $];
+        while ( rest.length && (rest[0] == ' ' || rest[0] == '\t') ) {
+            rest = rest[1 .. $];
+        }
+        if ( digits == 0 || (rest.length && rest[0] != ';') ) {
+            throw new DecodingException(RequestCause.protocol, "a chunk size is not a hexadecimal number");
+        }
+        auto number = l[0 .. digits];
+        while ( number.length > 1 && number[0] == '0' ) {
+            number = number[1 .. $];
+        }
+        if ( number.length > 16 ) {
+            throw new DecodingException(RequestCause.protocol, "a chunk size is too large");
+        }
+        ulong size;
+        foreach ( c; number ) {
+            size = size * 16 + (c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+        }
+        return size;
+    }
+    final ubyte[] get() {
         auto r = buff.__repr.__buffer[0];
         buff.popFrontN(r.length);
         return r;
@@ -361,12 +379,57 @@ public class DecodeChunked : DataPipeIface!ubyte {
     final void flush() {
     }
     final bool empty() {
-        debug(requests) tracef("empty=%b", buff.empty);
         return buff.empty;
     }
-    final bool done() {
-        return state==States.trailer && to_receive==0;
+    /// Whether the body has ended.
+    final bool done() const {
+        return state == State.done;
     }
+    /// Whether bytes arrived after the end of the body.
+    final bool surplus() const {
+        return _surplus;
+    }
+}
+
+unittest {
+    import std.exception : collectException;
+
+    string decoded(string text, size_t parts = 1) {
+        auto d = new DecodeChunked(64);
+        auto data = text.dup.representation;
+        immutable step = (data.length + parts - 1) / parts;
+        ubyte[] r;
+        for ( size_t i = 0; i < data.length; i += step ) {
+            d.putNoCopy(data[i .. min(i + step, $)]);
+            while ( !d.empty ) {
+                r ~= d.get();
+            }
+        }
+        assert(d.done);
+        return cast(string) r;
+    }
+    foreach ( parts; [1, 2, 7, 1000] ) {
+        assert(decoded("2\r\n12\r\n2\r\n34\r\n0\r\n\r\n", parts) == "1234");
+        // Extensions, LF line ends, leading zeros and trailer fields.
+        assert(decoded("02;name=value\n12\n000a ; x\r\n0123456789\r\n0;y\r\nTrailer: field\r\n\r\n", parts) == "120123456789");
+    }
+    DecodingException failure(string text) {
+        auto d = new DecodeChunked(64);
+        return collectException!DecodingException(d.putNoCopy(text.dup.representation));
+    }
+    assert(failure("x\r\n").cause == RequestCause.protocol);
+    assert(failure("\r\n").cause == RequestCause.protocol);
+    assert(failure("5x\r\n").cause == RequestCause.protocol);
+    assert(failure("1\r\nab\r\n").cause == RequestCause.protocol);
+    assert(failure("1\r\na0\r\n").cause == RequestCause.protocol);
+    // A size past 64 bits doesn't wrap around.
+    assert(failure("10000000000000000\r\n").cause == RequestCause.protocol);
+    assert(failure("1" ~ ";".replicate(1100) ~ "\r\n").cause == RequestCause.protocol);
+    assert(failure("0\r\n" ~ "T: v\r\n".replicate(20)).cause == RequestCause.limit);
+
+    auto d = new DecodeChunked(64);
+    d.putNoCopy("0\r\n\r\nHTTP".dup.representation);
+    assert(d.done && d.surplus);
 }
 
 unittest {
@@ -407,7 +470,7 @@ unittest {
     info("Test unchunker properties");
     ubyte[] twoChunks = "2\r\n12\r\n2\r\n34\r\n0\r\n\r\n".dup.representation;
     ubyte[][] result;
-    auto uc = new DecodeChunked();
+    auto uc = new DecodeChunked(1024);
     uc.putNoCopy(twoChunks);
     while(!uc.empty) {
         result ~= uc.get();

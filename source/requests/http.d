@@ -97,21 +97,187 @@ public class HTTPResponse : Response {
     @property final HTTPResponse[] history() @safe @nogc nothrow {
         return _history;
     }
+}
 
-    private int parse_version(in string v) pure const nothrow @safe {
-        // try to parse HTTP/1.x to version
-        try if ( v.length > 5 ) {
-            return (v[5..$].split(".").map!"to!int(a)".array[0..2].reduce!((a,b) => a*100 + b));
-        } catch (Exception e) {
-        }
-        return 0;
+/// Whether `s` is a token (RFC 9110, 5.6.2), as a method or a field name must be.
+private bool isToken(const(char)[] s) pure @safe {
+    return s.length > 0 && s.representation.all!(c => isAlphaNum(c) || "!#$%&'*+-.^_`|~".representation.canFind(c));
+}
+
+/// Whether `s` holds a control character other than HTAB, which no field value or line of a head may hold.
+private bool hasControl(const(char)[] s) pure @safe {
+    return s.representation.any!(c => (c < 0x20 && c != '\t') || c == 0x7F);
+}
+
+/// `s` without the spaces and tabs around it.
+private string trimmed(string s) pure @safe {
+    while ( s.length && (s[0] == ' ' || s[0] == '\t') ) {
+        s = s[1 .. $];
     }
-    unittest {
-        auto r = new HTTPResponse();
-        assert(r.parse_version("HTTP/1.1") == 101);
-        assert(r.parse_version("HTTP/1.0") == 100);
-        assert(r.parse_version("HTTP/0.9") == 9);
-        assert(r.parse_version("HTTP/xxx") == 0);
+    while ( s.length && (s[$ - 1] == ' ' || s[$ - 1] == '\t') ) {
+        s = s[0 .. $ - 1];
+    }
+    return s;
+}
+
+unittest {
+    assert(isToken("Content-Length") && isToken("x!#$%&'*+-.^_`|~1"));
+    assert(!isToken("") && !isToken("a b") && !isToken("a:b") && !isToken("a\r\nb") && !isToken("café"));
+    assert(hasControl("a\rb") && hasControl("a\nb") && hasControl("a\0b") && hasControl("\x7F"));
+    assert(!hasControl("a\tb c") && !hasControl("café"));
+    assert(trimmed(" \t a b\t ") == "a b" && trimmed(" ") == "");
+}
+
+/// Where the head of an HTTP message in `data` ends, past its empty line; -1 while it hasn't ended. Lines end with LF,
+/// and a CR before it is dropped (RFC 9112, 2.2). The search starts at `from`, the end of what was searched before.
+private ptrdiff_t headEnd(const(ubyte)[] data, size_t from = 0) pure nothrow @nogc @safe {
+    foreach ( i; from .. data.length ) {
+        if ( data[i] == '\n' && ((i >= 1 && data[i - 1] == '\n') || (i >= 2 && data[i - 1] == '\r' && data[i - 2] == '\n')) ) {
+            return i + 1;
+        }
+    }
+    return -1;
+}
+
+unittest {
+    assert(headEnd("HTTP/1.1 200 OK\r\n\r\n".representation) == 19);
+    assert(headEnd("HTTP/1.1 200 OK\n\nx".representation) == 17);
+    assert(headEnd("HTTP/1.1 200 OK\nA: b\r\n\r\n".representation) == 24);
+    assert(headEnd("HTTP/1.1 200 OK\r\nA: b\n\r\nx".representation) == 24);
+    assert(headEnd("HTTP/1.1 200 OK\r\n".representation) == -1);
+    assert(headEnd("HTTP/1.1 200 OK\r\n\r".representation) == -1);
+    assert(headEnd("HTTP/1.1 200 OK\r\n\r\n".representation, 18) == 19);
+}
+
+/**
+ * Parses status line `line`, `HTTP/x.y NNN [reason]`, into the version as 100 * x + y and the status code; false when
+ * it is not one. A code above 599 is left for the caller to take as a server error (RFC 9110, 15).
+ */
+private bool parseStatusLine(string line, out int version_, out ushort code) pure @safe {
+    immutable valid = line.length >= 12 && line.startsWith("HTTP/") && line[5].isDigit && line[6] == '.'
+        && line[7].isDigit && line[8] == ' ' && line[9] >= '1' && line[9] <= '9' && line[10].isDigit && line[11].isDigit
+        && (line.length == 12 || line[12] == ' ');
+    if ( !valid ) {
+        return false;
+    }
+    version_ = (line[5] - '0') * 100 + (line[7] - '0');
+    code = cast(ushort)((line[9] - '0') * 100 + (line[10] - '0') * 10 + (line[11] - '0'));
+    return true;
+}
+
+unittest {
+    int v;
+    ushort code;
+    assert(parseStatusLine("HTTP/1.1 200 OK", v, code) && v == HTTP11 && code == 200);
+    assert(parseStatusLine("HTTP/1.0 404", v, code) && v == HTTP10 && code == 404);
+    assert(parseStatusLine("HTTP/1.1 600  ", v, code) && code == 600);
+    foreach ( bad; ["", "HTTP/1.1", "HTTP/1.1 20 OK", "HTTP/1.1 2000 OK", "HTTP/1.1 099 X",
+            "HTTP/x.1 200 OK", "HTTP/1.1  200 OK", "ICY 200 OK", "HTTP/1.1 -20 OK"] ) {
+        assert(!parseStatusLine(bad, v, code), bad);
+    }
+}
+
+/// The length in a Content-Length value, which may repeat it in a list (RFC 9110, 8.6); -1 when it is not valid.
+private long contentLengthOf(string value) pure @safe {
+    long length = -1;
+    foreach ( item; value.splitter(',') ) {
+        immutable v = trimmed(item);
+        // 18 digits always fit a long.
+        if ( v.length == 0 || v.length > 18 || !v.representation.all!isDigit ) {
+            return -1;
+        }
+        immutable l = v.to!long;
+        if ( length >= 0 && l != length ) {
+            return -1;
+        }
+        length = l;
+    }
+    return length;
+}
+
+unittest {
+    assert(contentLengthOf("0") == 0);
+    assert(contentLengthOf("1024") == 1024);
+    assert(contentLengthOf("5, 5,5") == 5);
+    foreach ( bad; ["", " ", "5,6", "+5", "-1", "5x", "0x10", "1 0", "9999999999999999999", "5,"] ) {
+        assert(contentLengthOf(bad) == -1, bad);
+    }
+}
+
+/// A response as it arrives on its connection: how much of it has, and the decoding of its body.
+private final class Incoming {
+    NetworkStream  stream;
+    DataPipe!ubyte decoder;
+    DecodeChunked  unChunker;
+    /// Of the response on the wire, its head included.
+    ulong          bytes;
+    /// Of the body as the head gives it, -1 when it doesn't.
+    long           contentLength = -1;
+    /// Of the body on the wire.
+    long           contentReceived;
+    /// Whether bytes arrived past the end of the response, so that the connection can't carry another one.
+    bool           surplus;
+    private size_t bufferSize;
+    private uint   verbosity;
+
+    this(NetworkStream stream, size_t bufferSize, uint verbosity) {
+        this.stream = stream;
+        this.bufferSize = bufferSize;
+        this.verbosity = verbosity;
+        decoder = new DataPipe!ubyte();
+    }
+
+    /// Receives what comes next; null when the peer has closed the connection.
+    ubyte[] receive() {
+        auto b = new ubyte[bufferSize];
+        immutable read = stream.receive(b);
+        if ( read == 0 ) {
+            return null;
+        }
+        bytes += read;
+        if ( verbosity >= 3 ) {
+            writeln(b[0 .. read].dump.join("\n"));
+        }
+        return b[0 .. read];
+    }
+
+    /// Whether the body has a length or chunks, rather than ending with the connection.
+    bool framed() const {
+        return contentLength >= 0 || unChunker !is null;
+    }
+
+    /// Whether all of the body has arrived.
+    bool complete() {
+        return (contentLength >= 0 && contentReceived >= contentLength) || (unChunker !is null && unChunker.done);
+    }
+
+    /// Decodes `data`, the next bytes of the body.
+    void feed(ubyte[] data) {
+        if ( contentLength >= 0 && data.length > contentLength - contentReceived ) {
+            surplus = true;
+            data = data[0 .. cast(size_t)(contentLength - contentReceived)];
+        }
+        contentReceived += data.length;
+        decoder.putNoCopy(data);
+        if ( unChunker !is null && unChunker.surplus ) {
+            surplus = true;
+        }
+    }
+
+    /// Receives and decodes the next part of the body; false when the body has ended with the connection.
+    bool receiveBody() {
+        auto data = receive();
+        if ( data is null ) {
+            if ( framed ) {
+                throw new NetworkException(RequestCause.closed, "the connection closed before the end of the body");
+            }
+            return false;
+        }
+        if ( verbosity >= 2 ) {
+            writefln("< %d bytes of body received", data.length);
+        }
+        feed(data);
+        return true;
     }
 }
 
@@ -156,11 +322,7 @@ public struct HTTPRequest {
         bool           _useStreaming;                   // return iterator instead of completed request
 
         HTTPResponse[] _history;                        // redirects history
-        DataPipe!ubyte _bodyDecoder;
-        DecodeChunked  _unChunker;
-        long           _contentLength;
-        long           _contentReceived;
-        ulong          _responseBytes;                  // bytes of the current response, headers included
+        Incoming       _incoming;                       // the response to the current attempt, null before it is sent
         MonoTime       _deadlineAt;
         Payload        _payload;
         SSLOptions     _sslOptions;
@@ -191,8 +353,6 @@ public struct HTTPRequest {
     mixin(Getter_Setter!Duration   ("timeout"));
     mixin(Setter!Auth              ("authenticator"));
     mixin(Getter_Setter!bool       ("useStreaming"));
-    mixin(Getter                   ("contentLength"));
-    mixin(Getter                   ("contentReceived"));
     mixin(Getter_Setter!SSLOptions ("sslOptions"));
     mixin(Getter_Setter!string     ("bind"));
     mixin(Setter!NetStreamFactory  ("socketFactory"));
@@ -230,8 +390,7 @@ public struct HTTPRequest {
         _headers = null;
         _authenticator = null;
         _history = null;
-        _bodyDecoder = null;
-        _unChunker = null;
+        _incoming = null;
         //if ( _cm ) {
         //    _cm.clear();
         //}
@@ -430,105 +589,147 @@ public struct HTTPRequest {
     /// The exception for a response that can't be used, with what of it has arrived.
     private RequestException responseFailure(RequestCause cause, string message, Throwable next = null,
             string file = __FILE__, size_t line = __LINE__) {
-        return new RequestException(cause, _uri.host, _responseBytes, message, file, line, next);
+        return new RequestException(cause, _uri.host, _incoming is null ? 0 : _incoming.bytes, message, file, line, next);
     }
-    ///
-    /// Analyze received headers, take appropriate actions:
-    /// check content length, attach unchunk and uncompress
-    ///
+    /// Sets up the decoding of the body by the framing and the content coding in `headers`.
     private void analyzeHeaders(in string[string] headers) {
-
-        _contentLength = -1;
-        _unChunker = null;
         auto contentLength = "content-length" in headers;
-        if ( contentLength ) {
-            try {
-                string l = *contentLength;
-                _contentLength = parse!long(l);
-                // TODO: maybe add a strict mode that checks if l was parsed completely
-                if ( _maxContentLength && _contentLength > _maxContentLength) {
-                    throw responseFailure(RequestCause.limit, "ContentLength > maxContentLength (%d>%d)".
-                                format(_contentLength, _maxContentLength));
-                }
-            } catch (ConvException e) {
-                throw responseFailure(RequestCause.protocol, "Can't convert Content-Length from %s".format(*contentLength));
-            }
-        }
         auto transferEncoding = "transfer-encoding" in headers;
         if ( transferEncoding ) {
-            debug(requests) tracef("transferEncoding: %s", *transferEncoding);
-            if ( (*transferEncoding).toLower == "chunked") {
-                _unChunker = new DecodeChunked();
-                _bodyDecoder.insert(_unChunker);
+            // A response framed both ways may be read one way here and the other by a proxy (RFC 9112, 6.3).
+            if ( contentLength ) {
+                throw responseFailure(RequestCause.protocol, "the response has both Transfer-Encoding and Content-Length");
+            }
+            if ( (*transferEncoding).toLower != "chunked" ) {
+                throw responseFailure(RequestCause.protocol, "the response has a transfer coding other than chunked");
+            }
+            _incoming.unChunker = new DecodeChunked(_maxHeadersLength);
+            _incoming.decoder.insert(_incoming.unChunker);
+        } else if ( contentLength ) {
+            _incoming.contentLength = contentLengthOf(*contentLength);
+            if ( _incoming.contentLength < 0 ) {
+                throw responseFailure(RequestCause.protocol, "the response has no valid Content-Length");
+            }
+            if ( _maxContentLength && _incoming.contentLength > _maxContentLength ) {
+                throw responseFailure(RequestCause.limit, "Content-Length is above maxContentLength (%d > %d)"
+                    .format(_incoming.contentLength, _maxContentLength));
             }
         }
-        auto contentEncoding = "content-encoding" in headers;
-        if ( contentEncoding ) switch (*contentEncoding) {
-            default:
-                throw responseFailure(RequestCause.protocol, "Unknown content-encoding " ~ *contentEncoding);
-            case "gzip":
-            case "deflate":
-                _bodyDecoder.insert(new Decompressor!ubyte);
+        if ( auto contentEncoding = "content-encoding" in headers ) {
+            switch ( (*contentEncoding).toLower ) {
+                case "gzip", "x-gzip", "deflate":
+                    _incoming.decoder.insert(new Decompressor!ubyte);
+                    break;
+                case "identity":
+                    break;
+                default:
+                    throw responseFailure(RequestCause.protocol, "the response has an unsupported content coding");
+            }
         }
-
     }
-    ///
-    /// Called when we know that all headers already received in buffer.
-    /// This routine does not interpret headers content (see analyzeHeaders).
-    /// 1. Split headers on lines
-    /// 2. store status line, store response code
-    /// 3. unfold headers if needed
-    /// 4. store headers
-    ///
-    private void parseResponseHeaders(in ubyte[] input, string lineSep) {
-        string lastHeader;
-        auto buffer = cast(string)input;
-
-        foreach(line; buffer.split(lineSep).map!(l => l.stripRight)) {
-            if ( ! _response.status_line.length ) {
-                debug (requests) tracef("statusLine: %s", line);
-                _response.status_line = line;
+    /**
+     * Receives the head of the final response into `_response`, skipping interim 1xx ones; returns what arrived after
+     * it. All the heads together may be `maxHeadersLength` long.
+     */
+    private ubyte[] receiveHead() {
+        ubyte[] data;       // what has arrived and is not parsed yet
+        size_t parsed;      // the length of the heads before `data`
+        size_t searched;    // of `data`, for the end of the head
+        for (;;) {
+            // A line end may be left over from the previous response.
+            while ( data.length && (data[0] == '\n' || data.startsWith("\r\n".representation)) ) {
+                immutable n = data[0] == '\n' ? 1 : 2;
+                data = data[n .. $];
+                parsed += n;
+                searched = 0;
+            }
+            immutable end = headEnd(data, searched);
+            if ( end < 0 ) {
+                if ( parsed + data.length > _maxHeadersLength ) {
+                    throw responseFailure(RequestCause.limit, "the response headers are longer than maxHeadersLength (%d)"
+                        .format(_maxHeadersLength));
+                }
+                searched = data.length;
+                auto more = _incoming.receive();
+                if ( more is null ) {
+                    throw new NetworkException(RequestCause.closed, "the connection closed before the end of the response headers");
+                }
+                data ~= more;
+                continue;
+            }
+            parsed += end;
+            if ( parsed > _maxHeadersLength ) {
+                throw responseFailure(RequestCause.limit, "the response headers are longer than maxHeadersLength (%d)"
+                    .format(_maxHeadersLength));
+            }
+            parseHead(cast(string)data[0 .. end].idup);
+            data = data[end .. $];
+            searched = 0;
+            if ( _response.code >= 200 ) {
+                return data;
+            }
+            if ( _response.code == 101 ) {
+                throw responseFailure(RequestCause.protocol, "the server switched to another protocol, which the request didn't ask for");
+            }
+            // An interim response: the final one follows.
+            _response._status_line = null;
+            _response._code = 0;
+            _response._responseHeaders = null;
+        }
+    }
+    /// Parses `head`, from the status line to the empty line, into `_response`.
+    private void parseHead(string head) {
+        string[2][] fields;
+        bool statusLine;
+        foreach ( line; head.splitter('\n').map!(l => l.endsWith('\r') ? l[0 .. $ - 1] : l) ) {
+            if ( line.length == 0 ) {
+                break;
+            }
+            // A bare CR may end a line for someone else on the way (RFC 9112, 2.2).
+            if ( hasControl(line) ) {
+                throw responseFailure(RequestCause.protocol, "the response head holds a control character");
+            }
+            if ( !statusLine ) {
+                debug(requests) tracef("statusLine: %s", line);
                 if ( _verbosity >= 1 ) {
                     writefln("< %s", line);
                 }
-                auto parsed = line.split(" ");
-                if ( parsed.length >= 2 ) {
-                    try {
-                        _response.code = parsed[1].to!ushort;
-                    } catch (ConvException e) {
-                        throw responseFailure(RequestCause.protocol, "the status line has no valid status code");
-                    }
-                    _response._version = _response.parse_version(parsed[0]);
+                if ( !parseStatusLine(line, _response._version, _response._code) ) {
+                    throw responseFailure(RequestCause.protocol, "the response has no valid status line");
                 }
+                _response.status_line = line;
+                statusLine = true;
                 continue;
             }
             if ( line[0] == ' ' || line[0] == '\t' ) {
-                // unfolding https://tools.ietf.org/html/rfc822#section-3.1
-                if ( auto stored = lastHeader in _response._responseHeaders) {
-                    *stored ~= line;
+                // obs-fold, which stands for a space (RFC 9112, 5.2).
+                if ( fields.length == 0 ) {
+                    throw responseFailure(RequestCause.protocol, "the response headers start with a continuation line");
                 }
+                fields[$ - 1][1] = trimmed(fields[$ - 1][1] ~ " " ~ trimmed(line));
                 continue;
             }
-            auto parsed = line.findSplit(":");
-            auto header = parsed[0].toLower;
-            auto value = parsed[2].strip;
-
+            immutable colon = line.indexOf(':');
+            if ( colon <= 0 || !isToken(line[0 .. colon]) ) {
+                throw responseFailure(RequestCause.protocol, "a response header has no valid name");
+            }
+            fields ~= [line[0 .. colon].toLower, trimmed(line[colon + 1 .. $])];
+        }
+        foreach ( f; fields ) {
+            immutable header = f[0], value = f[1];
             if ( _verbosity >= 1 ) {
                 writefln("< %s: %s", header, value);
             }
-
-            lastHeader = header;
-            debug (requests) tracef("Header %s = %s", header, value);
-
-            if ( header != "set-cookie" ) {
-                auto stored = _response.responseHeaders.get(header, null);
-                if ( stored ) {
-                    value = stored ~ "," ~ value;
-                }
-                _response._responseHeaders[header] = value;
+            debug(requests) tracef("Header %s = %s", header, value);
+            if ( header == "set-cookie" ) {
+                _cookie._array ~= processCookie(value);
                 continue;
             }
-            _cookie._array ~= processCookie(value);
+            if ( auto stored = header in _response._responseHeaders ) {
+                *stored ~= "," ~ value;
+            } else {
+                _response._responseHeaders[header] = value;
+            }
         }
     }
 
@@ -735,263 +936,95 @@ public struct HTTPRequest {
         }
         debug(requests) tracef("proxy connection ready");
     }
-    /// Where the head of an HTTP message in `data` ends, past its empty line; -1 while it hasn't ended.
-    private static ptrdiff_t headEnd(const(ubyte)[] data) pure @safe {
-        immutable crlf = data.countUntil("\r\n\r\n".representation);
-        immutable lf = data.countUntil("\n\n".representation);
-        if ( crlf >= 0 && (lf < 0 || crlf < lf) ) {
-            return crlf + 4;
-        }
-        return lf >= 0 ? lf + 2 : -1;
-    }
-    unittest {
-        assert(headEnd("HTTP/1.1 200 OK\r\n\r\n".representation) == 19);
-        assert(headEnd("HTTP/1.1 200 OK\n\nx".representation) == 17);
-        assert(headEnd("HTTP/1.1 200 OK\r\n".representation) == -1);
-    }
-    ///
-    /// Request sent, now receive response.
-    /// Find headers, split on headers and body, continue to receive body
-    ///
-    private void receiveResponse(NetworkStream _stream) {
-
-        _bodyDecoder = new DataPipe!ubyte();
-        scope(exit) {
-            if ( !_useStreaming ) {
-                _bodyDecoder = null;
-                _unChunker = null;
-            }
-        }
-
-        auto buffer = Buffer!ubyte();
-        Buffer!ubyte partialBody;
-        ptrdiff_t read;
-        string lineSep = null, headersEnd = null;
-        bool headersHaveBeenReceived;
-
-        while( !headersHaveBeenReceived ) {
-
-            auto b = new ubyte[_bufferSize];
-            read = _stream.receive(b);
-
-            debug(requests) tracef("read: %d", read);
-            if ( read == 0 ) {
-                throw new NetworkException(RequestCause.closed, "the connection closed before the end of the response headers");
-            }
-            _responseBytes += read;
-            auto data = b[0..read];
-            buffer.putNoCopy(data);
-            if ( verbosity>=3 ) {
-                writeln(data.dump.join("\n"));
-            }
-
-            if ( buffer.length > maxHeadersLength ) {
-                throw responseFailure(RequestCause.limit, "Headers length > maxHeadersLength (%d > %d)".format(buffer.length, maxHeadersLength));
-            }
-
-            // Proper HTTP uses "\r\n" as a line separator, but broken servers sometimes use "\n".
-            // Servers that use "\r\n" might have "\n" inside a header.
-            // For any half-sane server, the first '\n' should be at the end of the status line, so this can be used to detect the line separator.
-            // In any case, all the interesting points in the header for now are at '\n' characters, so scan the newly read data for them.
-            foreach (idx; buffer.length-read..buffer.length)
-            {
-                if ( buffer[idx] == '\n' )
-                {
-                    if ( lineSep is null )
-                    {
-                        // First '\n'. Detect line/header endings.
-                        // HTTP header sections end with a double line separator
-                        lineSep = "\n";
-                        headersEnd = "\n\n";
-                        if ( idx > 0 && buffer[idx-1] == '\r' )
-                        {
-                            lineSep = "\r\n";
-                            headersEnd = "\r\n\r\n";
-                        }
-                    }
-                    else
-                    {
-                        // Potential header ending.
-                        if ( buffer.data[0..idx+1].endsWith(headersEnd) )
-                        {
-                            auto ResponseHeaders = buffer.data[0..idx+1-headersEnd.length];
-                            partialBody = buffer[idx+1..$];
-                            _contentReceived += partialBody.length;
-                            parseResponseHeaders(ResponseHeaders, lineSep);
-                            headersHaveBeenReceived = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        analyzeHeaders(_response._responseHeaders);
-
-        _bodyDecoder.putNoCopy(partialBody.data);
-
-        auto v = _bodyDecoder.get();
-        _response._responseBody.putNoCopy(v);
-
-        // https://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html#sec4.4
-        if  (
-                // document must not have body:
-                (_method == "HEAD") || responseMustNotIncludeBody(_response.code) || 
-                // we can receive doc without content length and without chunking only in streaming mode
-                // see https://github.com/ikod/dlang-requests/issues/146
-                ((_contentLength < 0 && _unChunker is null) && !_useStreaming)
-            )
-        {
+    /**
+     * Receives the response on `_incoming.stream`: its head, then its body; with `useStreaming`, once part of the body
+     * has arrived, the means to receive the rest. Without a length or chunks the body ends with the connection.
+     */
+    private void receiveResponse() {
+        auto rest = receiveHead();
+        if ( _method == "HEAD" || responseMustNotIncludeBody(_response.code) ) {
             debug(requests) tracef("response without body");
+            _incoming.surplus = rest.length > 0;
             return;
         }
-
-        _response._contentLength = _contentLength;
-        _response._contentReceived = _contentReceived;
-
-        if ( _verbosity >= 2 ) writefln("< %d bytes of body received", partialBody.length);
-
-        while( true ) {
-            if ( _contentLength >= 0 && _contentReceived >= _contentLength ) {
-                debug(requests) trace("Body received.");
-                break;
-            }
-            if ( _unChunker && _unChunker.done ) {
-                break;
-            }
-
+        analyzeHeaders(_response._responseHeaders);
+        _response._contentLength = _incoming.contentLength;
+        _incoming.feed(rest);
+        if ( _verbosity >= 2 ) {
+            writefln("< %d bytes of body received", rest.length);
+        }
+        _response._responseBody.putNoCopy(_incoming.decoder.get());
+        while ( !_incoming.complete ) {
             if ( _useStreaming && _response._responseBody.length && !redirectCodes.canFind(_response.code) ) {
                 debug(requests) trace("streaming requested");
-                // save _stream in closure
-                auto __stream = _stream;
-                auto __bodyDecoder = _bodyDecoder;
-                auto __unChunker = _unChunker;
-                auto __contentReceived = _contentReceived;
-                auto __contentLength = _contentLength;
-                auto __bufferSize = _bufferSize;
-                auto __response = _response;
-                auto __verbosity = _verbosity;
-                auto __host = _uri.host;
-                auto __responseBytes = _responseBytes;
-
-                RequestException failure(RequestCause cause, string message, Throwable next = null) {
-                    return new RequestException(cause, __host, __responseBytes, message, __FILE__, __LINE__, next);
-                }
-
-                // set up response
-                _response._contentLength = _contentLength;
-                _response.receiveAsRange.activated = true;
-                _response.receiveAsRange.data = _response._responseBody.data;
-                _response.receiveAsRange.cm = _cm;
-                _response.receiveAsRange.read = delegate ubyte[] () {
-
-                    while(true) {
-                        // check if we received everything we need
-                        if ( ( __unChunker && __unChunker.done )
-                            || (__contentLength >= 0 && __contentReceived >= __contentLength) )
-                        {
-                            debug(requests) trace("streaming_in receive completed");
-                            __bodyDecoder.flush();
-                            return __bodyDecoder.get();
-                        }
-                        // have to continue
-                        auto b = new ubyte[__bufferSize];
-                        ptrdiff_t read;
-                        try {
-                            read = __stream.receive(b);
-                        }
-                        catch (NetworkException e) {
-                            throw failure(e.cause, "streaming_in error reading from socket: " ~ e.msg, e);
-                        }
-                        debug(requests) tracef("streaming_in received %d bytes", read);
-
-                        if ( read == 0 ) {
-                            debug(requests) tracef("streaming_in: server closed connection");
-                            if ( __unChunker || __contentLength >= 0 ) {
-                                throw failure(RequestCause.closed, "the connection closed before the end of the body");
-                            }
-                            __bodyDecoder.flush();
-                            return __bodyDecoder.get();
-                        }
-
-                        if ( __verbosity>=3 ) {
-                            writeln(b[0..read].dump.join("\n"));
-                        }
-                        __response._contentReceived += read;
-                        __contentReceived += read;
-                        __responseBytes += read;
-                        try {
-                            __bodyDecoder.putNoCopy(b[0..read]);
-                        }
-                        catch (DecodingException e) {
-                            throw failure(RequestCause.protocol, e.msg, e);
-                        }
-                        auto res = __bodyDecoder.getNoCopy();
-                        if ( res.length == 0 ) {
-                            // there were nothing to produce (beginning of the chunk or no decompressed data)
-                            continue;
-                        }
-                        if (res.length == 1) {
-                            return res[0];
-                        }
-                        //
-                        // I'd like to "return _bodyDecoder.getNoCopy().join;" but it is slower
-                        //
-                        auto total = res.map!(b=>b.length).sum;
-                        // create buffer for joined bytes
-                        ubyte[] joined = new ubyte[total];
-                        size_t p;
-                        // memcopy
-                        foreach(ref _; res) {
-                            joined[p .. p + _.length] = _;
-                            p += _.length;
-                        }
-                        return joined;
-                    }
-                    assert(0);
-                };
-                // we prepared for streaming
+                streamBody();
                 return;
             }
-
-            auto b = new ubyte[_bufferSize];
-            read = _stream.receive(b);
-
-            if ( read == 0 ) {
-                debug(requests) trace("read done");
-                // Without a length or chunking the body ends with the connection.
-                if ( _unChunker || _contentLength >= 0 ) {
-                    throw new NetworkException(RequestCause.closed, "the connection closed before the end of the body");
-                }
+            if ( !_incoming.receiveBody() ) {
                 break;
             }
-            _responseBytes += read;
-            if ( _verbosity >= 2 ) {
-                writefln("< %d bytes of body received", read);
-            }
-
-            if ( verbosity>=3 ) {
-                writeln(b[0..read].dump.join("\n"));
-            }
-
-            debug(requests) tracef("read: %d", read);
-            _contentReceived += read;
-            if ( _maxContentLength && _contentReceived > _maxContentLength ) {
-                throw responseFailure(RequestCause.limit, "ContentLength > maxContentLength (%d>%d)".
-                    format(_contentLength, _maxContentLength));
-            }
-
-            _bodyDecoder.putNoCopy(b[0..read]); // send buffer to all decoders
-
-            _bodyDecoder.getNoCopy.             // fetch result and place to body
-                each!(b => _response._responseBody.putNoCopy(b));
-
-            debug(requests) tracef("receivedTotal: %d, contentLength: %d, bodyLength: %d", _contentReceived, _contentLength, _response._responseBody.length);
-
+            _incoming.decoder.getNoCopy.each!(b => _response._responseBody.putNoCopy(b));
         }
-        _bodyDecoder.flush();
-        _response._responseBody.putNoCopy(_bodyDecoder.get());
-        _response._contentReceived = _contentReceived;
+        _incoming.decoder.flush();
+        _response._responseBody.putNoCopy(_incoming.decoder.get());
+        _response._contentReceived = _incoming.contentReceived;
+    }
+    /// Lets the caller receive the rest of the body through `_response.receiveAsRange`.
+    private void streamBody() {
+        // The range outlives this request.
+        auto incoming = _incoming;
+        auto response = _response;
+        immutable host = _uri.host;
+        bool finished;
+
+        RequestException failure(RequestCause cause, string message, Throwable next) {
+            incoming.stream.close();
+            return new RequestException(cause, host, incoming.bytes, message, __FILE__, __LINE__, next);
+        }
+
+        response._contentReceived = incoming.contentReceived;
+        response.receiveAsRange.activated = true;
+        response.receiveAsRange.data = response._responseBody.data;
+        response.receiveAsRange.cm = _cm;
+        response.receiveAsRange.read = delegate ubyte[] () {
+            if ( finished ) {
+                return null;
+            }
+            try {
+                while ( !incoming.complete ) {
+                    if ( !incoming.receiveBody() ) {
+                        break;
+                    }
+                    response._contentReceived = incoming.contentReceived;
+                    auto res = incoming.decoder.getNoCopy();
+                    if ( res.length == 0 ) {
+                        // Nothing decoded yet, such as at the start of a chunk.
+                        continue;
+                    }
+                    if ( res.length == 1 ) {
+                        return res[0];
+                    }
+                    // Faster than join.
+                    ubyte[] joined = new ubyte[res.map!(b => b.length).sum];
+                    size_t p;
+                    foreach ( b; res ) {
+                        joined[p .. p + b.length] = b;
+                        p += b.length;
+                    }
+                    return joined;
+                }
+                incoming.decoder.flush();
+                finished = true;
+                if ( incoming.surplus ) {
+                    incoming.stream.close();
+                }
+                return incoming.decoder.get();
+            } catch (NetworkException e) {
+                throw failure(e.cause, e.msg, e);
+            } catch (DecodingException e) {
+                throw failure(e.cause, e.msg, e);
+            }
+        };
     }
     private bool isIdempotent(in string method) pure @safe nothrow {
         return ["GET", "HEAD"].canFind(method);
@@ -1003,7 +1036,7 @@ public struct HTTPRequest {
     ///
     void close_connection_if_not_keepalive(NetworkStream _stream) {
         auto connection = "connection" in _response._responseHeaders;
-        if ( !_keepAlive ) {
+        if ( !_keepAlive || _incoming.surplus ) {
             _stream.close();
         } else switch(_response._version) {
             case HTTP11:
@@ -1177,8 +1210,7 @@ public struct HTTPRequest {
     private NetworkStream exchange() {
         bool resent;
         for (;;) {
-            _contentReceived = 0;
-            _responseBytes = 0;
+            _incoming = null;
             _response._startedAt = Clock.currTime;
 
             immutable proxy = select_proxy(_uri.scheme);
@@ -1198,6 +1230,7 @@ public struct HTTPRequest {
             }
             _response._connectedAt = Clock.currTime;
             _stream.limits = limits();
+            _incoming = new Incoming(_stream, _bufferSize, _verbosity);
 
             try {
                 final switch ( _payload ) {
@@ -1213,7 +1246,7 @@ public struct HTTPRequest {
                 }
                 _response._requestSentAt = Clock.currTime;
                 debug(requests) trace("starting receive response");
-                receiveResponse(_stream);
+                receiveResponse();
                 debug(requests) trace("finished receive response");
                 _response._finishedAt = Clock.currTime;
                 return _stream;
@@ -1223,7 +1256,7 @@ public struct HTTPRequest {
                 _stream.close();
                 if ( auto ne = cast(NetworkException) e ) {
                     // A server may close a kept-alive connection just as the request goes out.
-                    if ( reused && !resent && _responseBytes == 0 && isIdempotent(_method)
+                    if ( reused && !resent && _incoming.bytes == 0 && isIdempotent(_method)
                         && (ne.cause == RequestCause.closed || ne.cause == RequestCause.reset) ) {
                         debug(requests) tracef("Server closed keepalive connection");
                         resent = true;
@@ -1232,7 +1265,7 @@ public struct HTTPRequest {
                     throw responseFailure(ne.cause, ne.msg, ne);
                 }
                 if ( auto de = cast(DecodingException) e ) {
-                    throw responseFailure(RequestCause.protocol, de.msg, de);
+                    throw responseFailure(de.cause, de.msg, de);
                 }
                 throw e;
             }

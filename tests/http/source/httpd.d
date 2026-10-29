@@ -279,7 +279,7 @@ struct HTTPD_Request {
         }
         else if ( auto contentTransferEncoding = "transfer-encoding" in _requestHeaders ) {
             if ( *contentTransferEncoding=="chunked" ) {
-                ds._unChunker = new DecodeChunked();
+                ds._unChunker = new DecodeChunked(32 * 1024);
                 ds._bodyDecoder.insert(ds._unChunker);
             }
         }
