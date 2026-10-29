@@ -553,14 +553,17 @@ public struct HTTPRequest {
 
         return generatedHeaders;
     }
-    /// The request target: the path and the query with `params`, or for an http request through a proxy the absolute URI.
+    /**
+     * The request target: the path and the query with `params`, or for an http request through a proxy the absolute
+     * URI, never with userinfo (RFC 9112, 3.2.2).
+     */
     private string requestTarget(QueryParam[] params = null) {
         string query = _uri.query;
         if ( params.length ) {
             query ~= (query.length ? "&" : "?") ~ params2query(params);
         }
         if ( select_proxy(_uri.scheme) && _uri.scheme != "https" ) {
-            return _uri.uri(No.params) ~ query;
+            return _uri.uri(No.params, No.userinfo) ~ query;
         }
         return _uri.path ~ query;
     }
@@ -879,6 +882,10 @@ public struct HTTPRequest {
         URI proxy;
         if ( !proxy.uri_parse(actual_proxy) ) {
             throw new ConnectError(ConnectStage.tcp, ConnectCause.local, _uri.host, "the proxy URL can't be parsed");
+        }
+        // Talking TLS to the proxy itself is not supported, and must not quietly become plain TCP.
+        if ( proxy.scheme != "http" ) {
+            throw new ConnectError(ConnectStage.tcp, ConnectCause.local, _uri.host, "only an http:// proxy is supported");
         }
         proxy.idn_encode();
         auto tunnel = new TCPStream();
