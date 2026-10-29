@@ -15,7 +15,8 @@ import std.exception : enforce;
 import std.format : format;
 import std.path : buildPath, dirName;
 import std.socket;
-import std.string : indexOf, lastIndexOf, split, toStringz;
+import std.string : indexOf, lastIndexOf, split, strip, toStringz;
+import core.stdc.config : c_long;
 
 import requests;
 import requests.ssl_adapter : openssl;
@@ -68,16 +69,23 @@ void hangUp(Socket c) {
     reset(c);
 }
 
-/// Accepts on 127.0.0.1 and, where available, ::1 on the same port, serving one connection at a time.
+/**
+ * Accepts on 127.0.0.1 and, where available, ::1 on the same port, serving one connection at a time unless
+ * `concurrent`.
+ */
 abstract class LoopbackServer {
     immutable ushort port;
     private Socket[] listeners;
     private Thread thread;
     private shared bool stopping;
+    private bool concurrent;
+    /// Connections accepted.
+    shared int accepted;
     /// Connections accepted on ::1.
     shared int acceptedInet6;
 
-    this() {
+    this(bool concurrent = false) {
+        this.concurrent = concurrent;
         auto v4 = new TcpSocket(AddressFamily.INET);
         v4.bind(new InternetAddress("127.0.0.1", 0));
         v4.listen(8);
@@ -151,18 +159,33 @@ abstract class LoopbackServer {
                     continue;
                 }
                 auto c = l.accept();
+                atomicOp!"+="(accepted, 1);
                 if (i > 0) {
                     atomicOp!"+="(acceptedInet6, 1);
                 }
                 c.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, 5.seconds);
                 c.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, 5.seconds);
-                try {
-                    serve(c);
-                } catch (Exception) {
+                if (concurrent) {
+                    serveApart(c);
+                } else {
+                    serveAndClose(c);
                 }
-                c.close();
             }
         }
+    }
+
+    private void serveAndClose(Socket c) {
+        try {
+            serve(c);
+        } catch (Exception) {
+        }
+        c.close();
+    }
+
+    private void serveApart(Socket c) {
+        auto t = new Thread({ serveAndClose(c); });
+        t.isDaemon = true;
+        t.start();
     }
 }
 
@@ -195,21 +218,42 @@ final class ResetServer : LoopbackServer {
     }
 }
 
+/// In a script of a `ScriptedServer`, the head of the request it was handed.
+string lastHead;
+
 /// Reads the head of each request and hands the connection to `script`.
 final class ScriptedServer : LoopbackServer {
     alias Script = void delegate(Socket client, ScriptedServer server);
     private Script script;
+    private string[] _heads;
     shared int served;
 
-    this(Script script) {
+    this(Script script, bool concurrent = false) {
         this.script = script;
-        super();
+        super(concurrent);
+    }
+
+    /// What arrived of every request so far: its head, maybe with part of its body.
+    string[] heads() {
+        synchronized (this) {
+            return _heads.dup;
+        }
+    }
+
+    /// Notes the head of another request that `script` reads on the same connection.
+    void note(string head) {
+        synchronized (this) {
+            _heads ~= head;
+        }
     }
 
     protected override void serve(Socket c) {
-        if (readHead(b => c.receive(b)) is null) {
+        immutable head = readHead(b => c.receive(b));
+        if (head is null) {
             return;
         }
+        note(head);
+        lastHead = head;
         atomicOp!"+="(served, 1);
         script(c, this);
     }
@@ -225,11 +269,58 @@ final class ScriptedServer : LoopbackServer {
 
 }
 
+/// The request target in `head`.
+string targetOf(string head) {
+    auto line = head[0 .. head.indexOf("\r\n")].split(' ');
+    return line.length == 3 ? line[1] : null;
+}
+
+/// Whether `head` has a header line `name: value` for some value, `name` in any case.
+bool hasHeader(string head, string name) {
+    import std.uni : toLower;
+
+    return head.toLower.canFind("\r\n" ~ name.toLower ~ ":");
+}
+
+/**
+ * Reads the rest of the body of the request whose head, and maybe part of the body, is `head`, by its Content-Length
+ * or to the last chunk, so that closing the connection doesn't reset it. Returns the body, its chunks as they came.
+ */
+string readBody(Socket c, string head) {
+    import std.algorithm : endsWith;
+    import std.uni : toLower;
+
+    auto lower = head.toLower;
+    char[] content = head[head.indexOf("\r\n\r\n") + 4 .. $].dup;
+    bool delegate() complete;
+    immutable at = lower.indexOf("\r\ncontent-length:");
+    if (at >= 0) {
+        immutable valueAt = at + "\r\ncontent-length:".length;
+        immutable length = head[valueAt .. valueAt + head[valueAt .. $].indexOf("\r\n")].strip.to!size_t;
+        complete = () => content.length >= length;
+    } else if (lower.canFind("\r\ntransfer-encoding: chunked\r\n")) {
+        complete = () => content.endsWith("\r\n0\r\n\r\n") || content == "0\r\n\r\n";
+    } else {
+        return null;
+    }
+    char[4096] buf;
+    while (!complete()) {
+        immutable n = c.receive(buf[]);
+        if (n <= 0) {
+            break;
+        }
+        content ~= buf[0 .. n];
+    }
+    return content.idup;
+}
+
 /// Server-side OpenSSL functions, from the OpenSSL that requests uses.
 private struct ServerSsl {
     extern (C) nothrow @nogc {
         void* function() TLS_server_method;
         void* function(void*) SSL_CTX_new;
+        c_long function(void*, int, c_long, void*) SSL_CTX_ctrl;
+        void function(void*, int) SSL_CTX_set_security_level;
         int function(void*, const(char)*, int) SSL_CTX_use_certificate_file;
         int function(void*, const(char)*, int) SSL_CTX_use_PrivateKey_file;
         void function(void*) SSL_CTX_free;
@@ -247,6 +338,8 @@ version (RequestsOpenSSLStatic) {
     private extern (C) nothrow @nogc {
         void* TLS_server_method();
         void* SSL_CTX_new(void*);
+        c_long SSL_CTX_ctrl(void*, int, c_long, void*);
+        void SSL_CTX_set_security_level(void*, int);
         int SSL_CTX_use_certificate_file(void*, const(char)*, int);
         int SSL_CTX_use_PrivateKey_file(void*, const(char)*, int);
         void SSL_CTX_free(void*);
@@ -313,22 +406,34 @@ enum TlsBehavior {
     hangUp,   /// hang up on the client, see `hangUp`
 }
 
+enum TLS1_1_VERSION = 0x0302;
+
 final class TlsServer : LoopbackServer {
     shared int served;
     private void* ctx;
     private TlsBehavior behavior;
+    private string response;
 
-    /// Serves `certName`.pem, issued for `server.key`.
-    this(string certName, TlsBehavior behavior = TlsBehavior.respond) {
+    /**
+     * Serves `certName`.pem, issued for `server.key`, answering a request with `response`; with `maxVersion`, such as
+     * `TLS1_1_VERSION`, no newer TLS version than that, at OpenSSL's security level 0, which allows TLS 1.1.
+     */
+    this(string certName, TlsBehavior behavior = TlsBehavior.respond, string response = okResponse, int maxVersion = 0) {
         enum filetypePem = 1;
+        enum SSL_CTRL_SET_MAX_PROTO_VERSION = 124;
         if (serverSsl.SSL_new is null) {
             serverSsl = loadServerSsl();
         }
         this.behavior = behavior;
+        this.response = response;
         ctx = serverSsl.SSL_CTX_new(serverSsl.TLS_server_method());
         enforce(ctx !is null);
         enforce(serverSsl.SSL_CTX_use_certificate_file(ctx, cert(certName ~ ".pem").toStringz, filetypePem) == 1);
         enforce(serverSsl.SSL_CTX_use_PrivateKey_file(ctx, cert("server.key").toStringz, filetypePem) == 1);
+        if (maxVersion != 0) {
+            serverSsl.SSL_CTX_set_security_level(ctx, 0);
+            enforce(serverSsl.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, maxVersion, null) == 1);
+        }
         super();
     }
 
@@ -349,7 +454,7 @@ final class TlsServer : LoopbackServer {
                 if (readHead(b => serverSsl.SSL_read(ssl, b.ptr, cast(int) b.length)) is null) {
                     return;
                 }
-                serverSsl.SSL_write(ssl, okResponse.ptr, cast(int) okResponse.length);
+                serverSsl.SSL_write(ssl, response.ptr, cast(int) response.length);
                 serverSsl.SSL_shutdown(ssl);
                 atomicOp!"+="(served, 1);
                 break;

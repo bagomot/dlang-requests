@@ -8,6 +8,7 @@ import requests;
 import requests.ssl_adapter : openssl;
 import support;
 import connect_tests;
+import security_tests;
 import tls_tests;
 
 shared static this() {
@@ -29,7 +30,7 @@ shared static this() {
             writefln("OpenSSL is unavailable: %s", e.msg);
         }
         UnitTestResult result;
-        static foreach (m; AliasSeq!(tls_tests, connect_tests)) {
+        static foreach (m; AliasSeq!(tls_tests, connect_tests, security_tests)) {
             static foreach (test; __traits(getUnitTests, m)) {
                 ++result.executed;
                 try {

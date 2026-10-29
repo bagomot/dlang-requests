@@ -45,6 +45,24 @@ unittest {
     assert(atomicLoad(server.served) == 0);
 }
 
+@("a certificate that names the host only in its subject's CN is refused")
+unittest {
+    auto server = new TlsServer("cn-only");
+    scope (exit) server.stop();
+    assertRefused(client(), "https://localhost:%d/".format(server.port), X509_V_ERR_HOSTNAME_MISMATCH);
+}
+
+@("a server that speaks no newer TLS than 1.1 is refused")
+unittest {
+    auto server = new TlsServer("localhost", TlsBehavior.respond, okResponse, TLS1_1_VERSION);
+    scope (exit) server.stop();
+    auto e = collectException!ConnectError(client().get("https://localhost:%d/".format(server.port)));
+    enforce(e !is null, "TLS 1.1 was accepted");
+    enforce(e.stage == ConnectStage.tlsHandshake && e.cause == ConnectCause.protocol,
+        "%s/%s: %s".format(e.stage, e.cause, e.msg));
+    assert(atomicLoad(server.served) == 0);
+}
+
 @("a self-signed certificate for the requested name is refused")
 unittest {
     auto server = new TlsServer("self-signed");
