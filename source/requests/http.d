@@ -21,6 +21,7 @@ import requests.uri;
 import requests.utils;
 import requests.base;
 import requests.connmanager;
+import requests.idna : IDNAException;
 import requests.rangeadapter;
 
 static immutable ushort[] redirectCodes = [301, 302, 303, 307, 308];
@@ -183,6 +184,61 @@ unittest {
     foreach ( bad; ["", "HTTP/1.1", "HTTP/1.1 20 OK", "HTTP/1.1 2000 OK", "HTTP/1.1 099 X",
             "HTTP/x.1 200 OK", "HTTP/1.1  200 OK", "ICY 200 OK", "HTTP/1.1 -20 OK"] ) {
         assert(!parseStatusLine(bad, v, code), bad);
+    }
+}
+
+/// The head of a response: its status line, the version and code in it, and its fields, names in lower case.
+private struct Head {
+    string statusLine;
+    int version_;
+    ushort code;
+    string[2][] fields;
+}
+
+/// Parses `head`, from the status line to the empty line, into `h`; what is wrong with it, or null when nothing is.
+private string parseHeadLines(string head, out Head h) pure @safe {
+    bool statusLine;
+    // Byte by byte: obs-text in a value need not be UTF-8.
+    foreach ( line; head.splitter('\n').map!(l => l.length && l[$ - 1] == '\r' ? l[0 .. $ - 1] : l) ) {
+        if ( line.length == 0 ) {
+            break;
+        }
+        // A bare CR may end a line for someone else on the way (RFC 9112, 2.2).
+        if ( hasControl(line) ) {
+            return "the head holds a control character";
+        }
+        if ( !statusLine ) {
+            if ( !parseStatusLine(line, h.version_, h.code) ) {
+                return "the head has no valid status line";
+            }
+            h.statusLine = line;
+            statusLine = true;
+            continue;
+        }
+        if ( line[0] == ' ' || line[0] == '\t' ) {
+            // obs-fold, which stands for a space (RFC 9112, 5.2).
+            if ( h.fields.length == 0 ) {
+                return "the header fields start with a continuation line";
+            }
+            h.fields[$ - 1][1] = trimmed(h.fields[$ - 1][1] ~ " " ~ trimmed(line));
+            continue;
+        }
+        immutable colon = line.indexOf(':');
+        if ( colon <= 0 || !isToken(line[0 .. colon]) ) {
+            return "a header field has no valid name";
+        }
+        h.fields ~= [line[0 .. colon].asciiLower, trimmed(line[colon + 1 .. $])];
+    }
+    return statusLine ? null : "the head has no valid status line";
+}
+
+unittest {
+    Head h;
+    assert(parseHeadLines("HTTP/1.1 200 OK\r\nA: b\r\n c\nX-Y:\r\n\r\n", h) is null);
+    assert(h.statusLine == "HTTP/1.1 200 OK" && h.code == 200 && h.fields == [["a", "b c"], ["x-y", ""]]);
+    foreach ( bad; ["", "\r\n", "HTTP/1.1 2\xff\xff OK\r\n\r\n", "HTTP/1.1 \xff\xfe\xfd X\r\n\r\n",
+            "HTTP/1.1 200 OK\r\n c\r\n\r\n", "HTTP/1.1 200 OK\r\nA b\r\n\r\n", "HTTP/1.1 200 OK\rA: b\r\n\r\n"] ) {
+        assert(parseHeadLines(bad, h) !is null, bad);
     }
 }
 
@@ -750,44 +806,18 @@ public struct HTTPRequest {
     }
     /// Parses `head`, from the status line to the empty line, into `_response`.
     private void parseHead(string head) {
-        string[2][] fields;
-        bool statusLine;
-        // Byte by byte: obs-text in a value need not be UTF-8.
-        foreach ( line; head.splitter('\n').map!(l => l.length && l[$ - 1] == '\r' ? l[0 .. $ - 1] : l) ) {
-            if ( line.length == 0 ) {
-                break;
-            }
-            // A bare CR may end a line for someone else on the way (RFC 9112, 2.2).
-            if ( hasControl(line) ) {
-                throw responseFailure(RequestCause.protocol, "the response head holds a control character");
-            }
-            if ( !statusLine ) {
-                debug(requests) tracef("statusLine: %s", line);
-                if ( _verbosity >= 1 ) {
-                    writefln("< %s", line);
-                }
-                if ( !parseStatusLine(line, _response._version, _response._code) ) {
-                    throw responseFailure(RequestCause.protocol, "the response has no valid status line");
-                }
-                _response.status_line = line;
-                statusLine = true;
-                continue;
-            }
-            if ( line[0] == ' ' || line[0] == '\t' ) {
-                // obs-fold, which stands for a space (RFC 9112, 5.2).
-                if ( fields.length == 0 ) {
-                    throw responseFailure(RequestCause.protocol, "the response headers start with a continuation line");
-                }
-                fields[$ - 1][1] = trimmed(fields[$ - 1][1] ~ " " ~ trimmed(line));
-                continue;
-            }
-            immutable colon = line.indexOf(':');
-            if ( colon <= 0 || !isToken(line[0 .. colon]) ) {
-                throw responseFailure(RequestCause.protocol, "a response header has no valid name");
-            }
-            fields ~= [line[0 .. colon].asciiLower, trimmed(line[colon + 1 .. $])];
+        Head h;
+        if ( auto problem = parseHeadLines(head, h) ) {
+            throw responseFailure(RequestCause.protocol, "the response is not valid: " ~ problem);
         }
-        foreach ( f; fields ) {
+        debug(requests) tracef("statusLine: %s", h.statusLine);
+        if ( _verbosity >= 1 ) {
+            writefln("< %s", h.statusLine);
+        }
+        _response._version = h.version_;
+        _response._code = h.code;
+        _response.status_line = h.statusLine;
+        foreach ( f; h.fields ) {
             immutable header = f[0], value = f[1];
             if ( _verbosity >= 1 ) {
                 writefln("< %s: %s", header, shownValue(header, value));
@@ -954,7 +984,7 @@ public struct HTTPRequest {
         NetworkStream stream;
         if ( _socketFactory ) {
             debug(requests) tracef("use socketFactory");
-            stream = _socketFactory(_uri.scheme, _uri.host, _uri.port);
+            stream = settingUp(ConnectStage.tcp, _uri.host, () => _socketFactory(_uri.scheme, _uri.host, _uri.port));
         }
         if ( stream is null ) {
             stream = connect();
@@ -981,7 +1011,13 @@ public struct HTTPRequest {
         if ( proxy.scheme != "http" ) {
             throw new ConnectError(ConnectStage.tcp, ConnectCause.local, _uri.host, "only an http:// proxy is supported");
         }
-        proxy.idn_encode();
+        try {
+            proxy.idn_encode();
+        } catch (IDNAException e) {
+            // Its message names the host.
+            throw new ConnectError(ConnectStage.tcp, ConnectCause.local, _uri.host,
+                "the proxy's host name is not a valid IDN");
+        }
         auto tunnel = new TCPStream();
         tunnel.bind(_bind);
         try {
@@ -993,7 +1029,7 @@ public struct HTTPRequest {
             return tunnel;
         }
         scope(failure) tunnel.close();
-        openTunnel(tunnel, proxy);
+        settingUp(ConnectStage.proxyConnect, _uri.host, { openTunnel(tunnel, proxy); });
         return new SSLStream(tunnel, _sslOptions, _uri.host, limits());
     }
     /// Asks the proxy on `tunnel` to connect it to the origin server, within `handshakeTimeout`.
@@ -1044,17 +1080,17 @@ public struct HTTPRequest {
                     throw failure(ConnectCause.protocol, "proxy CONNECT: " ~ e.msg, e);
             }
         }
-        auto head = cast(string)answer[0 .. end].idup;
-        if ( _verbosity >= 1 ) {
-            head.splitLines.filter!(l => l.length > 0).each!(l => writefln("< %s", l));
+        Head h;
+        if ( auto problem = parseHeadLines(cast(string)answer[0 .. end].idup, h) ) {
+            throw failure(ConnectCause.protocol, "the proxy's answer to CONNECT is not valid: " ~ problem);
         }
-        auto status = head.lineSplitter.front.split(' ');
-        if ( status.length < 2 || !status[0].startsWith("HTTP/") || status[1].length != 3 || !status[1].all!isDigit ) {
-            throw failure(ConnectCause.protocol, "the proxy's answer to CONNECT has no valid status line");
+        if ( _verbosity >= 1 ) {
+            writefln("< %s", h.statusLine);
+            h.fields.each!(f => writefln("< %s: %s", f[0], shownValue(f[0], f[1])));
         }
         // Any 2xx opens the tunnel (RFC 9110, 9.3.6).
-        if ( status[1][0] != '2' ) {
-            throw failure(ConnectCause.proxyStatus, "the proxy answered CONNECT with %s".format(status[1]));
+        if ( h.code / 100 != 2 ) {
+            throw failure(ConnectCause.proxyStatus, "the proxy answered CONNECT with %d".format(h.code));
         }
         // The origin server can't have spoken yet: TLS starts with the client.
         if ( answer.length > end ) {

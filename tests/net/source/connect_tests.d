@@ -7,7 +7,7 @@ import core.atomic : atomicLoad;
 import core.time : Duration, msecs, seconds;
 import std.algorithm : canFind;
 import std.array : replicate;
-import std.exception : enforce;
+import std.exception : collectException, enforce;
 import std.format : format;
 import std.socket : Address, AddressFamily, InternetAddress, Socket;
 
@@ -85,6 +85,35 @@ unittest {
     auto m = measure!ConnectError({ through(proxy).get("https://localhost:1/"); });
     expect(m, ConnectStage.proxyConnect, ConnectCause.proxyStatus);
     enforce(m.thrown.msg.canFind("407"), m.thrown.msg);
+}
+
+@("an answer to CONNECT is parsed as a response is, so that bytes that are not UTF-8 or a malformed line fail it as a protocol failure")
+unittest {
+    immutable answers = ["HTTP/1.1 \xff\xfe\xfd X\r\n\r\n", "HTTP/1.1 2\xff\xff OK\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nA b\r\n\r\n", "HTTP/1.1 200 OK\r\nX: a\rb\r\n\r\n", "HTTP/1.1 200 OK\r\n c\r\n\r\n",
+        "HTTP/1.1 20 OK\r\n\r\n", "\xff\r\n\r\n"];
+    auto proxy = new ScriptedServer((Socket c, ScriptedServer s) { c.send(answers[atomicLoad(s.served) - 1]); });
+    scope (exit) proxy.stop();
+    auto rq = client();
+    rq.proxy = "http://127.0.0.1:%d".format(proxy.port);
+    foreach (answer; answers) {
+        auto m = measure!ConnectError({ rq.get("https://localhost:1/"); });
+        enforce(m.thrown !is null, "%(%s%): no ConnectError".format([answer]));
+        expect(m, ConnectStage.proxyConnect, ConnectCause.protocol);
+    }
+    enforce(atomicLoad(proxy.served) == answers.length);
+}
+
+@("a proxy whose host name is not a valid IDN is a local failure, with no host name in the message")
+unittest {
+    auto rq = client();
+    rq.proxy = "http://тест-.example:3128";
+    foreach (url; ["http://origin.test/", "https://origin.test/"]) {
+        auto e = collectException!ConnectError(rq.get(url));
+        enforce(e !is null, "no ConnectError for " ~ url);
+        enforce(e.stage == ConnectStage.tcp && e.cause == ConnectCause.local, "%s/%s: %s".format(e.stage, e.cause, e.msg));
+        enforce(!e.msg.canFind("тест") && e.host == "origin.test", e.msg);
+    }
 }
 
 @("an answer to CONNECT that arrives in parts opens the tunnel, and CONNECT names the host in Host too")

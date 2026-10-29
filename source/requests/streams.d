@@ -24,7 +24,7 @@ import core.sync.mutex : Mutex;
 import core.thread : Thread;
 import core.time : MonoTime;
 
-import requests.ssl_adapter : openssl, OpenSSL, SSL, SSL_CTX, TLS1_2_VERSION, X509_V_OK,
+import requests.ssl_adapter : openssl, OpenSSL, OpenSSLUnavailableException, SSL, SSL_CTX, TLS1_2_VERSION, X509_V_OK,
     X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS;
 
 alias InDataHandler = DataPipeIface!ubyte;
@@ -72,6 +72,34 @@ public class ConnectError: Exception {
         this.cause = cause;
         this.host = host;
     }
+}
+
+/**
+ * Runs `step`, a part of `stage` of setting up a connection for `host`. What it throws other than a `ConnectError` or
+ * an `OpenSSLUnavailableException`, such as from a failed `select`, is a failure of this machine.
+ */
+package T settingUp(T)(ConnectStage stage, string host, scope T delegate() step) {
+    try {
+        return step();
+    } catch (ConnectError e) {
+        throw e;
+    } catch (OpenSSLUnavailableException e) {
+        throw e;
+    } catch (Exception e) {
+        throw new ConnectError(stage, ConnectCause.local, host, "a failure on this machine: " ~ e.msg, __FILE__, __LINE__, e);
+    }
+}
+
+unittest {
+    import std.exception : collectException;
+
+    auto e = collectException!ConnectError(settingUp(ConnectStage.proxyConnect, "origin.test", () {
+        throw new Exception("select failed");
+    }));
+    assert(e.stage == ConnectStage.proxyConnect && e.cause == ConnectCause.local && e.host == "origin.test");
+    auto c = new ConnectError(ConnectStage.tcp, ConnectCause.refused, "origin.test", "refused");
+    assert(collectException!ConnectError(settingUp(ConnectStage.tlsHandshake, "origin.test", () { throw c; })) is c);
+    assert(settingUp(ConnectStage.tcp, "origin.test", () => 1) == 1);
 }
 
 /// Why a request failed other than in setting up its connection.
@@ -1598,7 +1626,7 @@ public class SSLSocketStream: SocketStream {
         s = tunnel.release();
         __isOpen = true;
         scope(failure) close();
-        establish(host);
+        settingUp(ConnectStage.tlsHandshake, host, { establish(host); });
         __isConnected = true;
     }
 
@@ -1733,17 +1761,19 @@ public abstract class SocketStream : NetworkStream {
             immutable which = "address %d of %d".format(i + 1, addresses.length);
             debug(requests) tracef("Trying %s", a);
             try {
-                openSocket(a.addressFamily, host);
-                immutable rc = connectSocket(s, a, shareEnd);
-                if ( rc == -1 ) {
-                    throw new ConnectError(ConnectStage.tcp, ConnectCause.timeout, host, "TCP connection to %s timed out".format(which));
-                }
-                if ( rc != 0 ) {
-                    throw new ConnectError(ConnectStage.tcp, connectCause(rc), host,
-                        "TCP connection to %s failed: %s".format(which, formatSocketError(rc)));
-                }
-                s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
-                establish(host);
+                settingUp(ConnectStage.tcp, host, {
+                    openSocket(a.addressFamily, host);
+                    immutable rc = connectSocket(s, a, shareEnd);
+                    if ( rc == -1 ) {
+                        throw new ConnectError(ConnectStage.tcp, ConnectCause.timeout, host, "TCP connection to %s timed out".format(which));
+                    }
+                    if ( rc != 0 ) {
+                        throw new ConnectError(ConnectStage.tcp, connectCause(rc), host,
+                            "TCP connection to %s failed: %s".format(which, formatSocketError(rc)));
+                    }
+                    s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
+                });
+                settingUp(ConnectStage.tlsHandshake, host, { establish(host); });
                 __isConnected = true;
                 debug(requests) tracef("Connected to %s", a);
                 return this;
