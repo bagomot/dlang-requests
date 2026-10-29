@@ -41,8 +41,8 @@ $(TABLE
  $(TR
   $(TD maxContentLength)
   $(TD `size_t`)
-  $(TD max. acceptable content length)
-  $(TD `0` - unlimited)
+  $(TD longest body, as sent and decoded, a streamed one too; `0` - unlimited)
+  $(TD `64MB`)
  )
  $(TR
   $(TD bufferSize)
@@ -248,8 +248,8 @@ public struct Request {
         /// maximum headers length
         size_t                  _maxHeadersLength = 32 * 1024;   // 32 KB
 
-        /// maximum content length
-        size_t                  _maxContentLength;               // 0 - Unlimited
+        /// longest body, as sent and decoded; 0 for no limit
+        size_t                  _maxContentLength = defaultMaxContentLength;
 
         /// logging verbosity
         uint                    _verbosity = 0;
@@ -350,6 +350,9 @@ public struct Request {
     mixin(Getter_Setter!IPFamily("ipFamily"));
     mixin(Getter_Setter!bool("keepAlive"));
     mixin(Getter_Setter!uint("maxRedirects"));
+    /** Get/Set the longest body, both as sent, its chunks decoded, and decompressed, a streamed one too; zero for no
+     *  limit. Past it the request throws $(B RequestException) with `RequestCause.limit`.
+     */
     mixin(Getter_Setter!size_t("maxContentLength"));
     mixin(Getter_Setter!size_t("maxHeadersLength"));
     mixin(Getter_Setter!size_t("bufferSize"));

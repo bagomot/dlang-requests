@@ -25,6 +25,9 @@ import requests.rangeadapter;
 
 static immutable ushort[] redirectCodes = [301, 302, 303, 307, 308];
 
+/// The longest body a request accepts unless told otherwise: 64 MiB.
+public enum size_t defaultMaxContentLength = 64 * 1024 * 1024;
+
 enum   HTTP11 = 101;
 enum   HTTP10 = 100;
 
@@ -290,7 +293,7 @@ private final class Incoming {
 /// $(B keepAlive) - bool, set true for keepAlive requests. default true.
 /// $(B maxRedirects) - uint, maximum number of redirects. default 10.
 /// $(B maxHeadersLength) - size_t, maximum length of server response headers. default = 32KB.
-/// $(B maxContentLength) - size_t, maximun content length. delault - 0 = unlimited.
+/// $(B maxContentLength) - size_t, maximum length of the body, as sent and decoded. default = 64MB, 0 - unlimited.
 /// $(B bufferSize) - size_t, send and receive buffer size. default = 16KB.
 /// $(B verbosity) - uint, level of verbosity(0 - nothing, 1 - headers, 2 - headers and body progress). default = 0.
 /// $(B proxy) - string, set proxy url if needed. default - null.
@@ -307,7 +310,7 @@ public struct HTTPRequest {
         bool           _keepAlive = true;
         uint           _maxRedirects = 10;
         size_t         _maxHeadersLength = 32 * 1024;   // 32 KB
-        size_t         _maxContentLength;               // 0 - Unlimited
+        size_t         _maxContentLength = defaultMaxContentLength;
         string         _proxy;
         bool           _useEnvironmentProxy;
         uint           _verbosity = 0;                  // 0 - no output, 1 - headers, 2 - headers+body info
@@ -615,10 +618,18 @@ public struct HTTPRequest {
                     .format(_incoming.contentLength, _maxContentLength));
             }
         }
+        // Both the body as sent and decoded are bound: a stream of empty deflate blocks never ends, while a small one
+        // may inflate to any length.
+        if ( _maxContentLength ) {
+            _incoming.decoder.insert(new BodyLimit(_maxContentLength, "the body"));
+        }
         if ( auto contentEncoding = "content-encoding" in headers ) {
             switch ( (*contentEncoding).toLower ) {
                 case "gzip", "x-gzip", "deflate":
                     _incoming.decoder.insert(new Decompressor!ubyte);
+                    if ( _maxContentLength ) {
+                        _incoming.decoder.insert(new BodyLimit(_maxContentLength, "the decoded body"));
+                    }
                     break;
                 case "identity":
                     break;

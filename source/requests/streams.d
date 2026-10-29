@@ -391,6 +391,50 @@ public class DecodeChunked : DataPipeIface!ubyte {
     }
 }
 
+/// Passes the body through, failing once more than `limit` bytes of it in all have passed.
+public class BodyLimit : DataPipeIface!ubyte {
+    private {
+        ulong        limit;
+        ulong        passed;
+        string       what;
+        Buffer!ubyte buff;
+    }
+    /// `what` names the body at this point of decoding in the failure.
+    this(ulong limit, string what) {
+        this.limit = limit;
+        this.what = what;
+    }
+    final void putNoCopy(ubyte[] data) {
+        passed += data.length;
+        if ( passed > limit ) {
+            throw new DecodingException(RequestCause.limit, "%s is longer than maxContentLength (%d)".format(what, limit));
+        }
+        buff.putNoCopy(data);
+    }
+    final ubyte[] get() {
+        auto r = buff.__repr.__buffer[0];
+        buff.popFrontN(r.length);
+        return r;
+    }
+    final void flush() {
+    }
+    final bool empty() {
+        return buff.empty;
+    }
+}
+
+unittest {
+    import std.exception : collectException;
+
+    auto pipe = new DataPipe!ubyte;
+    pipe.insert(new BodyLimit(5, "the body"));
+    pipe.putNoCopy("abc".dup.representation);
+    pipe.putNoCopy("de".dup.representation);
+    assert(pipe.get() == "abcde".representation);
+    auto e = collectException!DecodingException(pipe.putNoCopy("f".dup.representation));
+    assert(e !is null && e.cause == RequestCause.limit && e.msg == "the body is longer than maxContentLength (5)");
+}
+
 unittest {
     import std.exception : collectException;
 
