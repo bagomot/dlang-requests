@@ -1079,13 +1079,18 @@ public struct HTTPRequest {
         _response._responseBody.putNoCopy(_incoming.decoder.get());
         _response._contentReceived = _incoming.contentReceived;
     }
-    /// Lets the caller receive the rest of the body through `_response.receiveAsRange`.
+    /**
+     * Lets the caller receive the rest of the body through `_response.receiveAsRange`. Until the body is in, the
+     * connection is the range's alone: a request after this one would read the rest of it as its response.
+     */
     private void streamBody() {
         // The range outlives this request.
         auto incoming = _incoming;
         auto response = _response;
-        immutable host = _uri.host;
+        immutable scheme = _uri.scheme, host = _uri.host, port = _uri.port, proxy = select_proxy(_uri.scheme);
+        immutable keep = keepsConnection();
         bool finished;
+        _cm.del(scheme, host, port, proxy);
 
         RequestException failure(RequestCause cause, string message, Throwable next) {
             incoming.stream.close();
@@ -1125,7 +1130,11 @@ public struct HTTPRequest {
                 }
                 incoming.decoder.flush();
                 finished = true;
-                if ( incoming.surplus ) {
+                if ( keep && incoming.framed && !incoming.surplus ) {
+                    if ( auto purged = response.receiveAsRange.cm.put(scheme, host, port, proxy, incoming.stream) ) {
+                        purged.close();
+                    }
+                } else {
                     incoming.stream.close();
                 }
                 return incoming.decoder.get();
@@ -1139,34 +1148,20 @@ public struct HTTPRequest {
     private bool isIdempotent(in string method) pure @safe nothrow {
         return ["GET", "HEAD"].canFind(method);
     }
-    ///
-    /// If we do not want keepalive request,
-    /// or server signalled to close connection,
-    /// then close it
-    ///
-    void close_connection_if_not_keepalive(NetworkStream _stream) {
-        auto connection = "connection" in _response._responseHeaders;
+    /// Whether the connection can carry another request after the response.
+    private bool keepsConnection() {
         if ( !_keepAlive || _incoming.surplus ) {
+            return false;
+        }
+        auto connection = "connection" in _response._responseHeaders;
+        auto options = connection ? (*connection).toLower.splitter(',').map!trimmed.array : null;
+        // HTTP/1.1 keeps it unless told to close, HTTP/1.0 only when told to keep it (RFC 9112, 9.3).
+        return _response._version >= HTTP11 ? !options.canFind("close") : options.canFind("keep-alive");
+    }
+    /// Closes `_stream` unless it can carry another request.
+    void close_connection_if_not_keepalive(NetworkStream _stream) {
+        if ( !keepsConnection() ) {
             _stream.close();
-        } else switch(_response._version) {
-            case HTTP11:
-                // HTTP/1.1 defines the "close" connection option for the sender to signal that the connection
-                // will be closed after completion of the response. For example,
-                //        Connection: close
-                // in either the request or the response header fields indicates that the connection
-                // SHOULD NOT be considered `persistent' (section 8.1) after the current request/response is complete.
-                // HTTP/1.1 applications that do not support persistent connections MUST include the "close" connection
-                // option in every message.
-                if ( connection && (*connection).toLower.split(",").canFind("close") ) {
-                    _stream.close();
-                }
-                break;
-            default:
-                // for anything else close connection if there is no keep-alive in Connection
-                if ( connection && !(*connection).toLower.split(",").canFind("keep-alive") ) {
-                    _stream.close();
-                }
-                break;
         }
     }
 
