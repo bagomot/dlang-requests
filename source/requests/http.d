@@ -1205,8 +1205,8 @@ public struct HTTPRequest {
 
     /**
      * Composes the request for `_uri`, before any connection. Throws `RequestCause.invalid` when it can't be sent as it
-     * is: the method or a header name is not a token, a header value holds a control character, or the target a
-     * control character or a space.
+     * is: the method or a header name is not a token, a header value holds a control character, the target a control
+     * character or a space, or a part of the multipart form a name or a parameter its Content-Disposition can't carry.
      */
     private Outgoing compose() {
         Outgoing o;
@@ -1272,23 +1272,33 @@ public struct HTTPRequest {
 
         o.boundary = randomUUID().toString;
         size_t contentLength;
+        // Content-Type goes on a line of its own, any other parameter into Content-Disposition, its value in quotes as
+        // the name's (RFC 7578, 4.2). In quotes a backslash would escape what follows it (RFC 9110, 5.6.4).
+        static bool isContentType(string key) {
+            return key.asciiLower == "content-type";
+        }
+        static bool quotable(string s) {
+            return !s.canFind('"') && !s.canFind('\\') && !hasControl(s);
+        }
+        static bool carried(string key, string value) {
+            return isContentType(key) ? !hasControl(value) : isToken(key) && quotable(value);
+        }
         foreach ( ref part; _multipartForm._sources ) {
-            // The name goes in quotes, and the parameters each on a line of their own.
-            if ( part.name.canFind('"') || hasControl(part.name)
-                    || part.parameters.byKeyValue.any!(p => hasControl(p.key) || hasControl(p.value)) ) {
+            if ( !quotable(part.name) || !part.parameters.byKeyValue.all!(p => carried(p.key, p.value))
+                    || part.parameters.byKey.count!isContentType > 1 ) {
                 throw invalid("a part of the multipart form has a name or a parameter it can't carry");
             }
             string ph = "--" ~ o.boundary ~ "\r\n";
             string disposition = `form-data; name="%s"`.format(part.name);
             string optionals = part.
                 parameters.byKeyValue().
-                filter!(p => p.key!="Content-Type").
-                map!   (p => "%s=%s".format(p.key, p.value)).
+                filter!(p => !isContentType(p.key)).
+                map!   (p => `%s="%s"`.format(p.key, p.value)).
                 join("; ");
 
-            ph ~= `Content-Disposition: ` ~ [disposition, optionals].join("; ") ~ "\r\n";
-            if ( auto contentType = "Content-Type" in part.parameters ) {
-                ph ~= "Content-Type: " ~ *contentType ~ "\r\n";
+            ph ~= `Content-Disposition: ` ~ (optionals.length ? disposition ~ "; " ~ optionals : disposition) ~ "\r\n";
+            foreach ( contentType; part.parameters.byKeyValue.filter!(p => isContentType(p.key)) ) {
+                ph ~= "Content-Type: " ~ contentType.value ~ "\r\n";
             }
             ph ~= "\r\n";
             o.partHeads ~= ph;
@@ -1297,6 +1307,35 @@ public struct HTTPRequest {
         contentLength += "--".length + o.boundary.length + "--\r\n".length;
         safeSetHeader(h, _userHeaders.ContentType, "Content-Type", "multipart/form-data; boundary=" ~ o.boundary);
         safeSetHeader(h, _userHeaders.ContentLength, "Content-Length", to!string(contentLength));
+    }
+    unittest {
+        import std.exception : collectException;
+
+        HTTPRequest rq;
+        rq._cookie = RefCounted!Cookies(Cookies());
+        rq._uri = URI("http://origin.example/");
+        rq._method = "POST";
+        rq._payload = Payload.multipart;
+        rq._multipartForm = MultipartForm().add(formData("a", "1"))
+            .add(formData("f", "2", ["filename": "my file.txt", "Content-Type": `text/plain; charset="utf-8"`]))
+            .add(formData("g", "3", ["content-type": "text/csv"]));
+        auto o = rq.compose();
+        immutable b = "--" ~ o.boundary ~ "\r\n";
+        assert(o.partHeads == [b ~ "Content-Disposition: form-data; name=\"a\"\r\n\r\n",
+            b ~ "Content-Disposition: form-data; name=\"f\"; filename=\"my file.txt\"\r\n"
+                ~ "Content-Type: text/plain; charset=\"utf-8\"\r\n\r\n",
+            b ~ "Content-Disposition: form-data; name=\"g\"\r\nContent-Type: text/csv\r\n\r\n"]);
+        foreach ( parameters; [["filename": `a"b`], ["file name": "x"], ["filename": "a\nb"], ["filename": `C:\dir\`],
+                ["Content-Type": "text/plain", "content-type": "text/csv"]] ) {
+            rq._multipartForm = MultipartForm().add(formData("f", "2", parameters));
+            auto e = collectException!RequestException(rq.compose());
+            assert(e !is null && e.cause == RequestCause.invalid);
+        }
+        foreach ( name; [`a"`, `a\`, "a\r"] ) {
+            rq._multipartForm = MultipartForm().add(formData(name, "2"));
+            auto e = collectException!RequestException(rq.compose());
+            assert(e !is null && e.cause == RequestCause.invalid);
+        }
     }
 
     /// Sends `o` on `stream`, its body from `_postData` or `_multipartForm` with those payloads.
