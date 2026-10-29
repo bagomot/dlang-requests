@@ -448,7 +448,7 @@ public struct Request {
     void addHeaders(in string[string] headers) {
         foreach(pair; headers.byKeyValue) {
             string _h = pair.key;
-            switch(toLower(_h)) {
+            switch(asciiLower(_h)) {
                 case "host":
                     _userHeaders.Host = true;
                     break;

@@ -38,13 +38,22 @@ struct URI {
         }
     }
 
-    /// Parses `uri`, an absolute http or https URI; its fragment is dropped, as it is never sent (RFC 9110, 4.2.4).
+    /**
+     * Parses `uri`, an absolute http or https URI, in UTF-8 where it is not ASCII; its fragment is dropped, as it is
+     * never sent (RFC 9110, 4.2.4).
+     */
     bool uri_parse(string uri) @safe pure {
+        import std.utf : validate, UTFException;
+        try {
+            validate(uri);
+        } catch (UTFException e) {
+            return false;
+        }
         uri = uri.findSplit("#")[0];
         auto i = uri.findSplit("://");
         string   rest, authority, path_and_query;
         if ( i[1].length ) {
-            _scheme = i[0].toLower;
+            _scheme = i[0].asciiLower;
             rest = i[2];
         } else {
             return false;
@@ -164,17 +173,17 @@ struct URI {
     }
     /**
      * The URI that `reference` stands for relative to this one (RFC 3986, 5.2), without its fragment. Throws
-     * `UriException` when it is not a reference to an http or https URI.
+     * `UriException` when it is not a reference to an http or https URI, which is in ASCII.
      */
     URI resolve(string reference) const @safe {
-        if ( reference.representation.any!(c => c <= 0x20 || c == 0x7F) ) {
-            throw new UriException("the reference holds a control character or a space");
+        if ( reference.representation.any!(c => c <= 0x20 || c >= 0x7F) ) {
+            throw new UriException("the reference holds a control character, a space or a character outside ASCII");
         }
         reference = reference.findSplit("#")[0];
         immutable scheme = schemeOf(reference);
         URI r;
         if ( scheme !is null || reference.startsWith("//") ) {
-            if ( scheme !is null && scheme.toLower !in standard_ports ) {
+            if ( scheme !is null && scheme.asciiLower !in standard_ports ) {
                 throw new UriException("the reference has a scheme other than http and https");
             }
             if ( !r.uri_parse(scheme is null ? _scheme ~ ":" ~ reference : reference) ) {
@@ -342,6 +351,8 @@ unittest {
     assertThrown!UriException(URI("http://[]/"));
     assertThrown!UriException(URI("http://[::1]x/"));
     assertThrown!UriException(URI("http://[example.test]/"));
+    assertThrown!UriException(URI("http://a\xff/"));
+    assertThrown!UriException(URI("http://a/\xC3"));
 
     // The fragment is not part of what is requested.
     a = URI("https://example.test/p?q#f");
@@ -390,7 +401,7 @@ unittest {
     assert(URI("http://u:p@a/b").resolve("c").username == "u");
     assert(URI("http://u:p@a/b").resolve("//d/").username is null);
     foreach ( bad; ["ftp://a/", "mailto:x@a", "javascript:alert(1)", "g:h", "http:g", "//", "///g", "/a b", "/a\tb",
-            "http://a/\r\nX: y", "//a:99999/"] ) {
+            "http://a/\r\nX: y", "//a:99999/", "//a\xff/", "/p\xff", "/café"] ) {
         assertThrown!UriException(base.resolve(bad), bad);
     }
 }

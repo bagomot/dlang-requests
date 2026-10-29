@@ -109,7 +109,7 @@ private bool hasControl(const(char)[] s) pure @safe {
 
 /// The value of field `name` as it may be printed: hidden for a field that carries credentials.
 private string shownValue(string name, string value) pure @safe {
-    return ["authorization", "proxy-authorization", "cookie", "set-cookie"].canFind(name.toLower) ? "<hidden>" : value;
+    return ["authorization", "proxy-authorization", "cookie", "set-cookie"].canFind(name.asciiLower) ? "<hidden>" : value;
 }
 
 unittest {
@@ -513,7 +513,7 @@ public struct HTTPRequest {
     void addHeaders(in string[string] headers) {
         foreach(pair; headers.byKeyValue) {
             string _h = pair.key;
-            switch(toLower(_h)) {
+            switch(asciiLower(_h)) {
             case "host":
                 _userHeaders.Host = true;
                 break;
@@ -566,7 +566,7 @@ public struct HTTPRequest {
             }
         }
         foreach ( name, value; _headers ) {
-            immutable lower = name.toLower;
+            immutable lower = name.asciiLower;
             if ( _leftOrigin && ["authorization", "proxy-authorization", "cookie", "host"].canFind(lower) ) {
                 continue;
             }
@@ -650,7 +650,7 @@ public struct HTTPRequest {
             if ( contentLength ) {
                 throw responseFailure(RequestCause.protocol, "the response has both Transfer-Encoding and Content-Length");
             }
-            if ( (*transferEncoding).toLower != "chunked" ) {
+            if ( (*transferEncoding).asciiLower != "chunked" ) {
                 throw responseFailure(RequestCause.protocol, "the response has a transfer coding other than chunked");
             }
             _incoming.unChunker = new DecodeChunked(_maxHeadersLength);
@@ -671,7 +671,7 @@ public struct HTTPRequest {
             _incoming.decoder.insert(new BodyLimit(_maxContentLength, "the body"));
         }
         if ( auto contentEncoding = "content-encoding" in headers ) {
-            switch ( (*contentEncoding).toLower ) {
+            switch ( (*contentEncoding).asciiLower ) {
                 case "gzip", "x-gzip", "deflate":
                     _incoming.decoder.insert(new Decompressor!ubyte);
                     if ( _maxContentLength ) {
@@ -739,7 +739,8 @@ public struct HTTPRequest {
     private void parseHead(string head) {
         string[2][] fields;
         bool statusLine;
-        foreach ( line; head.splitter('\n').map!(l => l.endsWith('\r') ? l[0 .. $ - 1] : l) ) {
+        // Byte by byte: obs-text in a value need not be UTF-8.
+        foreach ( line; head.splitter('\n').map!(l => l.length && l[$ - 1] == '\r' ? l[0 .. $ - 1] : l) ) {
             if ( line.length == 0 ) {
                 break;
             }
@@ -771,7 +772,7 @@ public struct HTTPRequest {
             if ( colon <= 0 || !isToken(line[0 .. colon]) ) {
                 throw responseFailure(RequestCause.protocol, "a response header has no valid name");
             }
-            fields ~= [line[0 .. colon].toLower, trimmed(line[colon + 1 .. $])];
+            fields ~= [line[0 .. colon].asciiLower, trimmed(line[colon + 1 .. $])];
         }
         foreach ( f; fields ) {
             immutable header = f[0], value = f[1];
@@ -814,7 +815,7 @@ public struct HTTPRequest {
         foreach ( attribute; parts ) {
             auto av = attribute.findSplit("=");
             immutable v = trimmed(av[2]);
-            switch ( trimmed(av[0]).toLower ) {
+            switch ( trimmed(av[0]).asciiLower ) {
                 case "path":
                     path = v.startsWith("/") ? v : null;
                     break;
@@ -898,6 +899,8 @@ public struct HTTPRequest {
             next = base.resolve(location);
         } catch (UriException e) {
             throw responseFailure(RequestCause.redirect, "the redirect can't be followed: " ~ e.msg, e);
+        } catch (Exception e) {
+            throw responseFailure(RequestCause.redirect, "the redirect can't be followed", e);
         }
         try {
             next.idn_encode();
@@ -1154,7 +1157,7 @@ public struct HTTPRequest {
             return false;
         }
         auto connection = "connection" in _response._responseHeaders;
-        auto options = connection ? (*connection).toLower.splitter(',').map!trimmed.array : null;
+        auto options = connection ? (*connection).asciiLower.splitter(',').map!trimmed.array : null;
         // HTTP/1.1 keeps it unless told to close, HTTP/1.0 only when told to keep it (RFC 9112, 9.3).
         return _response._version >= HTTP11 ? !options.canFind("close") : options.canFind("keep-alive");
     }

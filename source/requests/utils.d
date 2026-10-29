@@ -92,6 +92,23 @@ unittest {
     assert(rank!(string) == 1);
     assert(rank!(ubyte[][]) == 2);
 }
+/**
+ * `s` with the ASCII letters in lower case and every other byte as it is: names in HTTP and URIs are case-insensitive
+ * in ASCII only (RFC 9110, 5.1; RFC 3986, 6.2.2.1), and what comes from the network need not be UTF-8.
+ */
+package string asciiLower(const(char)[] s) pure nothrow @safe {
+    auto r = new char[s.length];
+    foreach ( i, c; s ) {
+        r[i] = c >= 'A' && c <= 'Z' ? cast(char)(c + ('a' - 'A')) : c;
+    }
+    return (() @trusted => cast(string) r)();
+}
+
+package unittest {
+    assert(asciiLower("Content-Type: GZIP") == "content-type: gzip");
+    assert(asciiLower("\xC3\x80\xFFI") == "\xC3\x80\xFFi");
+}
+
 /// Whether request path `p1` is in cookie path `p2` (RFC 6265, 5.1.4).
 bool pathMatches(string p1, string p2) pure @safe @nogc {
     import std.algorithm;
