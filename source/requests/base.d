@@ -309,7 +309,7 @@ public class Response {
     }
     /// string representation of response
     override string toString() const {
-        return "Response(%d, %s)".format(_code, _finalURI.uri());
+        return "Response(%d, %s)".format(_code, _finalURI.uri(Yes.params, No.userinfo));
     }
     /// format response to string (hpPqsBTUS).
     /**
@@ -355,7 +355,7 @@ public class Response {
                     a.put(_uri.query);
                     break;
                 case 's':
-                    a.put("Response(%d, %s)".format(_code, _finalURI.uri()));
+                    a.put(toString());
                     break;
                 case 'B': // received bytes
                     a.put("%d".format(_responseBody.length));

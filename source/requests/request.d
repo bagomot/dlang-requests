@@ -489,7 +489,7 @@ public struct Request {
         return execute(method, url, aa2params(query));
     }
     string toString() const {
-        return "Request(%s, %s)".format(_method, _uri.uri());
+        return "Request(%s, %s)".format(_method, _uri.uri(Yes.params, No.userinfo));
     }
     string format(string fmt) const {
         import std.array;
@@ -725,14 +725,14 @@ struct _LineReader
         if (!_lineSplitter.empty)
         {
             _data = _lineSplitter.get();
-            debug(requests) tracef("data1 = <<<%s>>>", cast(string)_data);
+            debug(requests) tracef("line of %d bytes", _data.length);
             return;
         }
         if ( _stream.empty )
         {
             _lineSplitter.flush();
             _data = _lineSplitter.get();
-            debug(requests) tracef("data2 = <<<%s>>>", cast(string)_data);
+            debug(requests) tracef("last line of %d bytes", _data.length);
             return;
         }
         while(_lineSplitter.empty && !_stream.empty)
@@ -742,6 +742,6 @@ struct _LineReader
             _stream.popFront();
         }
         _data = _lineSplitter.get();
-        debug(requests) tracef("data3 = <<<%s>>>", cast(string)_data);
+        debug(requests) tracef("line of %d bytes", _data.length);
     }
 }

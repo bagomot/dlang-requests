@@ -107,6 +107,17 @@ private bool hasControl(const(char)[] s) pure @safe {
     return s.representation.any!(c => (c < 0x20 && c != '\t') || c == 0x7F);
 }
 
+/// The value of field `name` as it may be printed: hidden for a field that carries credentials.
+private string shownValue(string name, string value) pure @safe {
+    return ["authorization", "proxy-authorization", "cookie", "set-cookie"].canFind(name.toLower) ? "<hidden>" : value;
+}
+
+unittest {
+    assert(shownValue("Authorization", "Bearer x") == "<hidden>");
+    assert(shownValue("set-cookie", "a=b") == "<hidden>");
+    assert(shownValue("Content-Type", "text/plain") == "text/plain");
+}
+
 /// `s` without the spaces and tabs around it.
 private string trimmed(string s) pure @safe {
     while ( s.length && (s[0] == ' ' || s[0] == '\t') ) {
@@ -323,6 +334,7 @@ public struct HTTPRequest {
         URI            _origin;                         // the URL asked for
         bool           _leftOrigin;                     // whether a redirect has left the origin of `_origin`
         bool           _bodyDropped;                    // whether a redirect has dropped the body of the request
+        string[]       _authHeaderNames;                // of the authenticator's headers in the request, to hide them
         Incoming       _incoming;                       // the response to the current attempt, null before it is sent
         MonoTime       _deadlineAt;
         Payload        _payload;
@@ -397,7 +409,7 @@ public struct HTTPRequest {
         //}
     }
     string toString() const {
-        return "HTTPRequest(%s, %s)".format(_method, _uri.uri());
+        return "HTTPRequest(%s, %s)".format(_method, _uri.uri(Yes.params, No.userinfo));
     }
     string format(string fmt) const {
         import std.array;
@@ -438,8 +450,9 @@ public struct HTTPRequest {
     /// The proxy for `scheme`: the one set, or with `useEnvironmentProxy` the one in `<scheme>_proxy` or `all_proxy`
     /// (either case); null for none.
     string select_proxy(string scheme) {
+        // The proxy URL may hold credentials, so it is not traced.
         if ( _proxy ) {
-            debug(requests) tracef("proxy=%s", _proxy);
+            debug(requests) tracef("proxy: the one set");
             return _proxy;
         }
         if ( _useEnvironmentProxy ) {
@@ -447,7 +460,7 @@ public struct HTTPRequest {
             foreach ( name; [scheme, "all"] ) {
                 auto p = environment.get(name ~ "_proxy", environment.get(name.toUpper() ~ "_PROXY"));
                 if ( p.length > 0 ) {
-                    debug(requests) tracef("proxy=%s", p);
+                    debug(requests) tracef("proxy: from %s_proxy", name);
                     return p;
                 }
             }
@@ -513,11 +526,12 @@ public struct HTTPRequest {
 
         // Credentials go only to the origin of the URL asked for, and stop once a redirect has left it: from
         // elsewhere a server could send them to any path of the origin. The caller's Host is for that origin too.
+        _authHeaderNames = null;
         if ( _authenticator && !_leftOrigin ) {
-            _authenticator.
-                authHeaders(_uri.host).
-                byKeyValue.
-                each!(pair => generatedHeaders[pair.key] = pair.value);
+            foreach ( name, value; _authenticator.authHeaders(_uri.host) ) {
+                generatedHeaders[name] = value;
+                _authHeaderNames ~= name;
+            }
         }
         foreach ( name, value; _headers ) {
             immutable lower = name.toLower;
@@ -729,9 +743,9 @@ public struct HTTPRequest {
         foreach ( f; fields ) {
             immutable header = f[0], value = f[1];
             if ( _verbosity >= 1 ) {
-                writefln("< %s: %s", header, value);
+                writefln("< %s: %s", header, shownValue(header, value));
             }
-            debug(requests) tracef("Header %s = %s", header, value);
+            debug(requests) tracef("Header %s = %s", header, shownValue(header, value));
             if ( header == "set-cookie" ) {
                 _cookie._array ~= processCookie(value);
                 continue;
@@ -1097,6 +1111,7 @@ public struct HTTPRequest {
     /// A request ready to go: its head, and how its body follows.
     private struct Outgoing {
         string   head;       /// the request line and the header fields, up to the empty line
+        string   shownHead;  /// the head as it may be printed, see `shownValue`
         string   form;       /// with `Payload.params`, the form that is the body
         bool     chunked;    /// with `Payload.range`, whether the data goes in chunks
         string   boundary;   /// with `Payload.multipart`, the boundary between the parts
@@ -1163,11 +1178,16 @@ public struct HTTPRequest {
                 throw invalid("the value of header %s holds a control character".format(name));
             }
         }
-        Appender!string head;
+        Appender!string head, shown;
         head.put("%s %s HTTP/1.1\r\n".format(_method, target));
-        h.byKeyValue.each!(kv => head.put(kv.key ~ ": " ~ kv.value ~ "\r\n"));
+        shown.put("%s %s HTTP/1.1\r\n".format(_method, target));
+        foreach ( name, value; h ) {
+            head.put(name ~ ": " ~ value ~ "\r\n");
+            shown.put(name ~ ": " ~ (_authHeaderNames.canFind(name) ? "<hidden>" : shownValue(name, value)) ~ "\r\n");
+        }
         head.put("\r\n");
         o.head = head.data;
+        o.shownHead = shown.data;
         return o;
     }
 
@@ -1206,9 +1226,9 @@ public struct HTTPRequest {
 
     /// Sends `o` on `stream`, its body from `_postData` or `_multipartForm` with those payloads.
     private void send(NetworkStream stream, ref Outgoing o) {
-        debug(requests) trace(o.head);
+        debug(requests) trace(o.shownHead);
         if ( _verbosity >= 1 ) {
-            o.head.splitLines.each!(a => writeln("> " ~ a));
+            o.shownHead.splitLines.each!(a => writeln("> " ~ a));
         }
         stream.send(o.head);
         final switch ( _payload ) {
@@ -1432,7 +1452,7 @@ public struct HTTPRequest {
             _response.finalURI = next_uri;
 
             follow(next_uri);
-            debug(requests) tracef("Redirected to %s", next_uri);
+            debug(requests) tracef("Redirected to %s", next_uri.uri(Yes.params, No.userinfo));
         }
     }
 }

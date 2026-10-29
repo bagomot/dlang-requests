@@ -546,7 +546,7 @@ public class LineSplitter : DataPipeIface!ubyte
     }
     void putNoCopy(ubyte[] s)
     {
-        debug(requests) tracef("put data: <<%s>>", cast(string)s);
+        debug(requests) tracef("put %d bytes", s.length);
         buff.putNoCopy(s);
         if (NL == -1)
         {
