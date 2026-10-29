@@ -161,12 +161,12 @@ package bool domainMatches(string d1, string d2) pure @safe @nogc {
 }
 
 package unittest {
-    assert("x.example.com".domainMatches(".example.com"));
-    assert(!"x.example.com".domainMatches("example.com"));
-    assert(!"example.com".domainMatches(".x.example.com"));
-    assert("example.com".domainMatches("example.com"));
-    assert(!"example.com".domainMatches(""));
-    assert(!"".domainMatches("example.com"));
+    assert("x.example.test".domainMatches(".example.test"));
+    assert(!"x.example.test".domainMatches("example.test"));
+    assert(!"example.test".domainMatches(".x.example.test"));
+    assert("example.test".domainMatches("example.test"));
+    assert(!"example.test".domainMatches(""));
+    assert(!"".domainMatches("example.test"));
 }
 
 string[] dump(in ubyte[] data) {

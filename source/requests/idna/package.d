@@ -180,7 +180,7 @@ unittest {
         assert(alabel(u) == a);
     }
     assert(toLower("Тест") == "тест");
-    assert(idn_encode("abc.de") == "abc.de");
+    assert(idn_encode("abc.example") == "abc.example");
     assert(idn_encode("тест") != "тест");
     assert(idn_encode("\u30c6\u30b9\u30c8.xn--zckzah") == "xn--zckzah.xn--zckzah");
     assert(idn_encode("\u30c6\u30b9\u30c8\uff0e\u30c6\u30b9\u30c8") == "xn--zckzah.xn--zckzah");

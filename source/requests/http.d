@@ -617,9 +617,9 @@ public struct HTTPRequest {
 
     unittest {
         HTTPRequest request;
-        request._uri = URI("https://www.blub.de/");
+        request._uri = URI("https://origin.example/");
         assert(request.requestTarget([QueryParam("a", "b"), QueryParam("c", "d")]) == "/?a=b&c=d");
-        request._uri = URI("https://www.blub.de/p?x=1");
+        request._uri = URI("https://origin.example/p?x=1");
         assert(request.requestTarget([QueryParam("a", "b")]) == "/p?x=1&a=b");
         assert(request.requestTarget() == "/p?x=1");
     }
