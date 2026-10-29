@@ -92,14 +92,6 @@ unittest {
         auto f = File(tmpfname, "wb");
         f.rawWrite("abcdefgh\n12345678\n");
         f.close();
-        // files
-        info("Check POST files");
-        PostFile[] files = [
-            {fileName: tmpfname, fieldName:"abc", contentType:"application/octet-stream"}, 
-            {fileName: tmpfname}
-        ];
-        rs = rq.post(httpbinUrl ~ "post", files);
-        assert(rs.code==200);
         info("Check POST chunked from file.byChunk");
         f = File(tmpfname, "rb");
         rs = rq.post(httpbinUrl ~ "post", f.byChunk(3), "application/octet-stream");

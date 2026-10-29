@@ -70,17 +70,6 @@ public class BasicAuthentication: Auth {
     }
 }
 
-/**
- * Struct to send multiple files in POST request.
- */
-public struct PostFile {
-    /// Path to the file to send.
-    string fileName;
-    /// Name of the field (if empty - send file base name)
-    string fieldName;
-    /// contentType of the file if not empty
-    string contentType;
-}
 ///
 /// This is File-like interface for sending data to multipart forms
 ///

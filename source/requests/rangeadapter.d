@@ -13,6 +13,7 @@ module requests.rangeadapter;
 
 import std.format;
 import std.range.primitives;
+import std.traits : isArray, Unqual;
 
 private template rank(R) {
     static if ( isInputRange!R ) {
@@ -20,6 +21,35 @@ private template rank(R) {
     } else {
         enum size_t rank = 0;
     }
+}
+
+private template isBytes(T) {
+    static if ( isArray!T ) {
+        alias E = Unqual!(ElementEncodingType!T);
+        enum isBytes = is(E == ubyte) || is(E == byte) || is(E == char);
+    } else {
+        enum isBytes = false;
+    }
+}
+
+/**
+ * Whether a request body can come from `R`: an array of `ubyte`, `byte` or `char`, sent with its length, or an input
+ * range of such arrays, sent chunk by chunk.
+ */
+public enum isBodyRange(R) = (rank!R == 1 && isBytes!R) || (rank!R == 2 && isBytes!(ElementType!R));
+
+unittest {
+    static struct S {
+        string s;
+    }
+    static struct B {
+        ubyte b;
+    }
+    enum E : ubyte { a }
+    static assert(isBodyRange!string && isBodyRange!(ubyte[]) && isBodyRange!(string[]) && isBodyRange!(ubyte[][]));
+    static assert(isBodyRange!(const(byte)[]) && isBodyRange!(char[]) && isBodyRange!(immutable(ubyte)[][]));
+    static assert(!isBodyRange!(int[]) && !isBodyRange!(S[]) && !isBodyRange!(dstring) && !isBodyRange!(int[][]));
+    static assert(!isBodyRange!(bool[]) && !isBodyRange!(B[]) && !isBodyRange!(E[]) && !isBodyRange!(bool[][]));
 }
 
 /*
@@ -38,7 +68,8 @@ private struct Adapter(R) {
     this(R r)
     {
         _r = r;
-        static if ( _rank == 1 && hasLength!R ) {
+        // A string has no length as a range of code points, but its bytes have one.
+        static if ( _rank == 1 ) {
             _length = _r.length;
         }
     }
@@ -82,11 +113,10 @@ private auto ma(R)(R r) {
 }
 
 ///
-/// makeAdapter convert input range of ubytes (rank 1 or rank 2),
-/// So that it can be used in POST requests
+/// Wraps a request body, see `isBodyRange`, so that it can be used in POST requests.
 /// You can use it in Interceptors to modify/set POST data.
 ///
-public InputRangeAdapter makeAdapter(R)(R r) {
+public InputRangeAdapter makeAdapter(R)(R r) if (isBodyRange!R) {
     auto adapter = ma(r);
     InputRangeAdapter result;
     result._front = &adapter.front;
@@ -137,14 +167,19 @@ unittest {
 
     auto s0 = "abc";
     InputRangeAdapter ira = makeAdapter(s0);
+    assert(ira.length == 3);
     assert(ira.equal(["abc"]));
 
     auto s1 = "abc".representation();
     ira = makeAdapter(s1);
+    assert(ira.length == 3);
     assert(ira.equal(["abc".representation()]));
+
+    assert(makeAdapter("кококо").length == 12);
 
     auto s2 = ["abc".representation, "кококо".representation];
     ira = makeAdapter(s2);
+    assert(ira.length == -1);
     assert(ira.equal(s2));
 
     auto f = File("README.md", "r");

@@ -567,7 +567,7 @@ public struct Request {
     {
         return execute("POST", uri, form);
     }
-    Response post(R)(string uri, R content, string contentType="application/octet-stream")
+    Response post(R)(string uri, R content, string contentType="application/octet-stream") if (isBodyRange!R)
     {
         return execute("POST", uri, content, contentType);
     }
@@ -588,7 +588,7 @@ public struct Request {
     {
         return execute("PUT", uri, form);
     }
-    Response put(R)(string uri, R content, string contentType="application/octet-stream")
+    Response put(R)(string uri, R content, string contentType="application/octet-stream") if (isBodyRange!R)
     {
         return execute("PUT", uri, content, contentType);
     }
@@ -600,7 +600,7 @@ public struct Request {
     {
         return execute("PATCH", uri, form);
     }
-    Response patch(R)(string uri, R content, string contentType="application/octet-stream")
+    Response patch(R)(string uri, R content, string contentType="application/octet-stream") if (isBodyRange!R)
     {
         return execute("PATCH", uri, content, contentType);
     }
@@ -612,7 +612,7 @@ public struct Request {
     {
         return execute("DELETE", uri, params);
     }
-    Response execute(R)(string method, string url, R content, string ct = "application/octet-stream") if (isInputRange!R)
+    Response execute(R)(string method, string url, R content, string ct = "application/octet-stream") if (isBodyRange!R)
     {
         _method = method;
         _uri = URI(url);
