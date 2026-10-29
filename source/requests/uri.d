@@ -231,23 +231,8 @@ struct URI {
             _query = "?" ~ s;
         }
     }
-//    mixin(setter("scheme"));
-//    mixin(setter("host"));
-//    mixin(setter("username"));
-//    mixin(setter("password"));
-//    mixin(setter("port"));
-//    mixin(setter("path"));
-//    mixin(setter("query"));
     @property auto uri(Flag!"params" params = Yes.params, Flag!"userinfo" userinfo = Yes.userinfo) pure @safe const {
         return recalc_uri(params, userinfo);
-    }
-    @property void uri(string s) @trusted {
-        _uri = s;
-        //        auto parsed = uri_grammar(s);
-        //        if ( !parsed.successful || parsed.matches.joiner.count != __uri.length) {
-        //            throw new UriException("Can't parse uri '" ~ __uri ~ "'");
-        //        }
-        //        traverseTree(parsed);
     }
     void idn_encode() @safe {
         _host = requests.idna.idn_encode(_original_host);

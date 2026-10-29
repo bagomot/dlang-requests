@@ -24,13 +24,13 @@ $(TABLE
   $(TD verbosity)
   $(TD `uint`)
   $(TD verbosity level $(LPAREN)0, 1, 2 or 3$(RPAREN))
-  $(TD `16KB`)
+  $(TD `0`)
  )
  $(TR
   $(TD maxRedirects)
   $(TD `uint`)
   $(TD maximum redirects allowed $(LPAREN)0 to disable redirects$(RPAREN))
-  $(TD `true`)
+  $(TD `10`)
  )
  $(TR
   $(TD maxHeadersLength)
@@ -280,8 +280,6 @@ public struct Request {
         /// address families to connect to
         IPFamily                _ipFamily;
 
-        /// verify peer when using ssl
-        bool                    _sslSetVerifyPeer = true;
         SSLOptions              _sslOptions;
 
         /// bind outgoing connections to this IP address

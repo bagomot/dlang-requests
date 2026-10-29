@@ -27,8 +27,6 @@ import core.time : MonoTime;
 import requests.ssl_adapter : openssl, OpenSSL, OpenSSLUnavailableException, SSL, SSL_CTX, TLS1_2_VERSION, X509_V_OK,
     X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS;
 
-alias InDataHandler = DataPipeIface!ubyte;
-
 /// Which addresses of a host name a connection may use.
 public enum IPFamily {
     any,    /// IPv4 and IPv6, in the resolver's order
@@ -636,38 +634,15 @@ unittest
  *  $(LI data method: return collected data (like Appender.data))
  * )
  */
-enum   CACHESIZE = 1024;
-
-static long reprAlloc;
-static long reprCacheHit;
-static long reprCacheRequests;
-
-
 public struct Buffer(T) {
-//    static Repr[CACHESIZE]  cache;
-//    static uint             cacheIndex;
-
     private {
-        Repr  cachedOrNew() {
-            return new Repr;
-//            reprCacheRequests++;
-//            if ( false && cacheIndex>0 ) {
-//                reprCacheHit++;
-//                cacheIndex -= 1;
-//                return cache[cacheIndex];
-//            } else {
-//                return new Repr;
-//            }
-        }
         class Repr {
             size_t         __length;
             Unqual!T[][]   __buffer;
             this() {
-                reprAlloc++;
                 __length = 0;
             }
             this(Repr other) {
-                reprAlloc++;
                 if ( other is null )
                     return;
                 __length = other.__length;
@@ -699,7 +674,7 @@ public struct Buffer(T) {
             return;
         }
         if ( !__repr ) {
-            __repr = cachedOrNew();
+            __repr = new Repr;
         }
         static if (!is(U == T)) {
             auto d = cast(T[])(data);
@@ -716,7 +691,7 @@ public struct Buffer(T) {
             return;
         }
         if ( !__repr ) {
-            __repr = cachedOrNew();
+            __repr = new Repr;
         }
         static if (!is(U == T)) {
             auto d = cast(T[])(data);

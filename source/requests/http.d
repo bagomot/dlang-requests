@@ -40,28 +40,6 @@ private enum Payload {
     multipart,  /// a multipart form
 }
 
-///
-///
-///
-//public auto queryParams(T...)(T params) pure nothrow @safe
-//{
-//    static assert (T.length % 2 == 0, "wrong args count");
-//
-//    QueryParam[] output;
-//    output.reserve = T.length / 2;
-//
-//    void queryParamsHelper(T...)(T params, ref QueryParam[] output)
-//    {
-//        static if (T.length > 0)
-//        {
-//            output ~= QueryParam(params[0].to!string, params[1].to!string);
-//            queryParamsHelper(params[2..$], output);
-//        }
-//    }
-//
-//    queryParamsHelper(params, output);
-//    return output;
-//}
 
 ///
 /// Response - result of request execution.
@@ -392,7 +370,7 @@ private final class Incoming {
 /// $(B verbosity) - uint, level of verbosity(0 - nothing, 1 - headers, 2 - headers and body progress). default = 0.
 /// $(B proxy) - string, set proxy url if needed. default - null.
 /// $(B cookie) - Tuple Cookie, Read/Write cookie You can get cookie setted by server, or set cookies before doing request.
-/// $(B timeout) - Duration, Set timeout value for connect/receive/send.
+/// $(B timeout) - Duration, the longest wait for sending to progress or for data to arrive.
 ///
 public struct HTTPRequest {
     private {
@@ -470,18 +448,12 @@ public struct HTTPRequest {
     @property void sslSetCaCert(string path) pure @safe nothrow @nogc {
         _sslOptions.setCaCert(path);
     }
-    //@property final void cookie(Cookie[] s) pure @safe @nogc nothrow {
-    //    _cookie = s;
-    //}
     @property final void proxy(string v) {
         if ( v != _proxy ) {
             _cm.clear();
         }
         _proxy = v;
     }
-    //@property final Cookie[] cookie() pure @safe @nogc nothrow {
-    //    return _cookie;
-    //}
 
     this(string uri) {
         _uri = URI(uri);
@@ -492,9 +464,6 @@ public struct HTTPRequest {
         _authenticator = null;
         _history = null;
         _incoming = null;
-        //if ( _cm ) {
-        //    _cm.clear();
-        //}
     }
     string toString() const {
         return "HTTPRequest(%s, %s)".format(_method, _uri.uri(Yes.params, No.userinfo));
@@ -563,7 +532,6 @@ public struct HTTPRequest {
         _headers = null;
     }
     @property void uri(in URI newURI) {
-        //handleURLChange(_uri, newURI);
         _uri = newURI;
     }
     /// Add headers to request
@@ -1625,7 +1593,7 @@ public struct HTTPRequest {
             if ( _history.length >= _maxRedirects ) {
                 throw responseFailure(RequestCause.redirect, "%d redirects reached maxRedirects".format(_history.length));
             }
-            // "location" in response already checked in canFollowRedirect
+            // willFollowRedirect has seen it.
             immutable new_location = *("location" in _response.responseHeaders);
             immutable current_uri = _uri;
             immutable next_uri = redirectTarget(_uri, new_location);
