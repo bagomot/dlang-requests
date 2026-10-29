@@ -1335,7 +1335,7 @@ version(none) private unittest {
     auto cookiesSet(in App app, ref HTTPD_Request rq, RequestArgs args) {
         Cookie[] cookies;
         foreach(p; rq.query.byKeyValue) {
-            cookies ~= Cookie("/cookies", rq.requestHeaders["host"], p.key, p.value);
+            cookies ~= Cookie("/cookies", rq.requestHeaders["host"], p.key, p.value, false);
         }
         auto rs = response(rq, buildReply(rq), 302);
         rs.headers["Location"] = "/cookies";

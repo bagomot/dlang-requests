@@ -92,17 +92,38 @@ unittest {
     assert(rank!(string) == 1);
     assert(rank!(ubyte[][]) == 2);
 }
-// test if p1 is sub-path of p2 (used to find Cookie to send)
+/// Whether request path `p1` is in cookie path `p2` (RFC 6265, 5.1.4).
 bool pathMatches(string p1, string p2) pure @safe @nogc {
     import std.algorithm;
-    return p1.startsWith(p2);
+    return p1 == p2 || (p1.startsWith(p2) && (p2.endsWith("/") || p1[p2.length] == '/'));
 }
 
 package unittest {
     assert("/abc/def".pathMatches("/"));
     assert("/abc/def".pathMatches("/abc"));
+    assert("/abc/def".pathMatches("/abc/"));
     assert("/abc/def".pathMatches("/abc/def"));
     assert(!"/def".pathMatches("/abc"));
+    assert(!"/abcdef".pathMatches("/abc"));
+}
+
+/// The path of a cookie set in a response to request path `path` without a Path of its own (RFC 6265, 5.1.4).
+package string defaultCookiePath(string path) pure @safe {
+    import std.algorithm : startsWith;
+    import std.string : lastIndexOf;
+    if ( !path.startsWith("/") ) {
+        return "/";
+    }
+    immutable last = path.lastIndexOf('/');
+    return last <= 0 ? "/" : path[0 .. last];
+}
+
+package unittest {
+    assert(defaultCookiePath("") == "/");
+    assert(defaultCookiePath("/") == "/");
+    assert(defaultCookiePath("/a") == "/");
+    assert(defaultCookiePath("/a/b") == "/a");
+    assert(defaultCookiePath("/a/b/") == "/a/b");
 }
 
 // test if d1 is subbomain of d2 (used to find Cookie to send)
@@ -213,7 +234,8 @@ package unittest {
 }
 
 
-public alias Cookie     = Tuple!(string, "path", string, "domain", string, "attr", string, "value");
+/// A cookie: `attr` is its name; `secure` ones go only over https.
+public alias Cookie     = Tuple!(string, "path", string, "domain", string, "attr", string, "value", bool, "secure");
 public alias QueryParam = Tuple!(string, "key", string, "value");
 
 struct Cookies {

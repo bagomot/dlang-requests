@@ -186,6 +186,38 @@ unittest {
     }
 }
 
+/// The time in IMF-fixdate `value`, such as `Sun, 06 Nov 1994 08:49:37 GMT` (RFC 9110, 5.6.7); null when it is not one.
+private Nullable!SysTime imfFixdate(string value) @safe {
+    static immutable days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    static immutable months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    Nullable!SysTime none;
+    alias digits = (size_t from, size_t n) => value[from .. from + n].representation.all!isDigit;
+    if ( value.length != 29 || !days.canFind(value[0 .. 3]) || value[3 .. 5] != ", " || !digits(5, 2) || value[7] != ' '
+            || !months.canFind(value[8 .. 11]) || value[11] != ' ' || !digits(12, 4) || value[16] != ' '
+            || !digits(17, 2) || value[19] != ':' || !digits(20, 2) || value[22] != ':' || !digits(23, 2)
+            || value[25 .. $] != " GMT" ) {
+        return none;
+    }
+    try {
+        immutable month = cast(int) months.countUntil(value[8 .. 11]) + 1;
+        return Nullable!SysTime(SysTime(DateTime(value[12 .. 16].to!int, month, value[5 .. 7].to!int,
+            value[17 .. 19].to!int, value[20 .. 22].to!int, value[23 .. 25].to!int), UTC()));
+    } catch (DateTimeException e) {
+        // Such as 31 Feb.
+        return none;
+    }
+}
+
+unittest {
+    assert(imfFixdate("Thu, 01 Jan 1970 00:00:00 GMT").get == SysTime(DateTime(1970, 1, 1), UTC()));
+    assert(imfFixdate("Sun, 06 Nov 1994 08:49:37 GMT").get == SysTime(DateTime(1994, 11, 6, 8, 49, 37), UTC()));
+    foreach ( bad; ["", "1 Jan  00:00 EST", "16 Jan 99: 00:00EST", "Thu, 01 Jan 70 00:00:00 GMT",
+            "Thursday, 01-Jan-70 00:00:00 GMT", "Thu, 31 Feb 1970 00:00:00 GMT", "Thu, 01 Jan 1970 25:00:00 GMT",
+            "Thu, 01 Jan 1970 00:00:00 UTC", "Thu, 01 Xyz 1970 00:00:00 GMT", "Thu, 01 Jan 1970 00:00:00 GMT "] ) {
+        assert(imfFixdate(bad).isNull, bad);
+    }
+}
+
 /// The length in a Content-Length value, which may repeat it in a list (RFC 9110, 8.6); -1 when it is not valid.
 private long contentLengthOf(string value) pure @safe {
     long length = -1;
@@ -554,9 +586,10 @@ public struct HTTPRequest {
 
         if ( _cookie._array.length && (!_userHeaders.Cookie || _leftOrigin) ) {
             auto cs = _cookie._array.
-                filter!(c => _uri.path.pathMatches(c.path) && _uri.host.domainMatches(c.domain)).
+                filter!(c => _uri.path.pathMatches(c.path) && _uri.host.domainMatches(c.domain)
+                    && (!c.secure || _uri.scheme == "https")).
                 map!(c => "%s=%s".format(c.attr, c.value)).
-                joiner(";");
+                joiner("; ");
             if ( ! cs.empty )
             {
                 generatedHeaders["Cookie"] = to!string(cs);
@@ -747,7 +780,7 @@ public struct HTTPRequest {
             }
             debug(requests) tracef("Header %s = %s", header, shownValue(header, value));
             if ( header == "set-cookie" ) {
-                _cookie._array ~= processCookie(value);
+                storeCookie(value);
                 continue;
             }
             if ( auto stored = header in _response._responseHeaders ) {
@@ -758,58 +791,89 @@ public struct HTTPRequest {
         }
     }
 
-    ///
-    /// Process Set-Cookie header from server response
-    ///
-    private Cookie[] processCookie(string value ) pure {
-        // cookie processing
-        //
-        // as we can't join several set-cookie lines in single line
-        // < Set-Cookie: idx=7f2800f63c112a65ef5082957bcca24b; expires=Mon, 29-May-2017 00:31:25 GMT; path=/; domain=example.com
-        // < Set-Cookie: idx=7f2800f63c112a65ef5082957bcca24b; expires=Mon, 29-May-2017 00:31:25 GMT; path=/; domain=example.com, cs=ip764-RgKqc-HvSkxRxdQQAKW8LA; path=/; domain=.example.com; HttpOnly
-        //
-        Cookie[] res;
-        string[string] kv;
-        auto fields = value.split(";").map!strip;
-        while(!fields.empty) {
-            auto s = fields.front.findSplit("=");
-            fields.popFront;
-            if ( s[1] != "=" ) {
-                continue;
-            }
-            auto k = s[0];
-            auto v = s[2];
-            switch(k.toLower()) {
-                case "domain":
-                    k = "domain";
-                    break;
+    /**
+     * Stores the cookie of Set-Cookie value `value` (RFC 6265, 5.2) for the host of the response, in place of one of the
+     * same name and path; a Max-Age of 0 or less or an Expires in the past, given as an IMF-fixdate (RFC 9110, 5.6.7),
+     * removes it. Domain is not taken: without the list of public suffixes nothing would keep a host from setting a
+     * cookie for every name under one, so a cookie only goes back to the host that set it. A Secure one comes only over
+     * https and goes only over https.
+     */
+    private void storeCookie(string value) {
+        if ( value.length == 0 ) {
+            return;
+        }
+        auto parts = value.splitter(';');
+        auto pair = parts.front.findSplit("=");
+        parts.popFront;
+        immutable name = trimmed(pair[0]), content = trimmed(pair[2]);
+        if ( !pair[1].length || !isToken(name) ) {
+            return;
+        }
+        string path;
+        bool secure, maxAge, expired;
+        foreach ( attribute; parts ) {
+            auto av = attribute.findSplit("=");
+            immutable v = trimmed(av[2]);
+            switch ( trimmed(av[0]).toLower ) {
                 case "path":
-                    k = "path";
+                    path = v.startsWith("/") ? v : null;
+                    break;
+                case "secure":
+                    secure = true;
+                    break;
+                case "max-age":
+                    // Max-Age wins over Expires.
+                    immutable seconds = v.startsWith("-") ? v[1 .. $] : v;
+                    if ( seconds.length && seconds.representation.all!isDigit ) {
+                        maxAge = true;
+                        expired = v.startsWith("-") || seconds.all!(c => c == '0');
+                    }
                     break;
                 case "expires":
-                    continue;
-                case "max-age":
-                    continue;
+                    // In another format the cookie lasts as long as the request.
+                    if ( !maxAge ) {
+                        immutable at = imfFixdate(v);
+                        expired = !at.isNull && at.get <= Clock.currTime;
+                    }
+                    break;
                 default:
                     break;
             }
-            kv[k] = v;
         }
-        if ( "domain" !in kv ) {
-            kv["domain"] = _uri.host;
+        if ( secure && _uri.scheme != "https" ) {
+            return;
         }
-        if ( "path" !in kv ) {
-            kv["path"] = _uri.path;
+        if ( path is null ) {
+            path = defaultCookiePath(_uri.path);
         }
-        auto domain = kv["domain"]; kv.remove("domain");
-        auto path   = kv["path"];   kv.remove("path");
-        foreach(pair; kv.byKeyValue) {
-            auto _attr = pair.key;
-            auto _value = pair.value;
-            auto cookie = Cookie(path, domain, _attr, _value);
-            res ~= cookie;
+        _cookie._array = _cookie._array.filter!(c => !(c.attr == name && c.domain == _uri.host && c.path == path)).array;
+        if ( !expired ) {
+            _cookie._array ~= Cookie(path, _uri.host, name, content, secure);
         }
-        return res;
+    }
+    unittest {
+        HTTPRequest rq;
+        rq._cookie = RefCounted!Cookies(Cookies());
+        rq._uri = URI("https://example.test/a/b?q");
+        rq.storeCookie("id=1; Path=/; Secure; HttpOnly; SameSite=Lax; Domain=test");
+        rq.storeCookie("n = v ; Max-Age=60");
+        rq.storeCookie("bad name=1");
+        rq.storeCookie("novalue");
+        assert(rq._cookie._array == [Cookie("/", "example.test", "id", "1", true), Cookie("/a", "example.test", "n", "v", false)]);
+        rq.storeCookie("id=2; Path=/; Secure");
+        assert(rq._cookie._array.length == 2 && rq._cookie._array[1].value == "2");
+        rq.storeCookie("id=; Path=/; Max-Age=0");
+        rq.storeCookie("n=; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+        assert(rq._cookie._array.length == 0);
+        rq.storeCookie("");
+        rq.storeCookie("x=1; Expires=1 Jan  00:00 EST");
+        assert(rq._cookie._array.length == 1);
+        rq._cookie._array = null;
+        rq.storeCookie("e=1; Max-Age=60; Expires=Thu, 01 Jan 1970 00:00:00 GMT");
+        assert(rq._cookie._array.length == 1);
+        rq._uri = URI("http://example.test/");
+        rq.storeCookie("s=1; Secure");
+        assert(rq._cookie._array.length == 1);
     }
 
     private bool willFollowRedirect() {
