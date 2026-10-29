@@ -362,7 +362,7 @@ public struct Request {
     /// $(B v) - full url to proxy; null, the default, connects directly unless `useEnvironmentProxy` is set.
     mixin(Getter_Setter!string("proxy"));
     /// Without a `proxy`, take the proxy from the environment: `http_proxy`, `https_proxy` by the URL's scheme, then
-    /// `all_proxy`, in lower or upper case. Off by default: the environment is not consulted.
+    /// `all_proxy`, in lower or upper case but for `http_proxy`. Off by default: the environment is not consulted.
     mixin(Getter_Setter!bool("useEnvironmentProxy"));
     mixin(Getter_Setter!string("method"));
     mixin(Getter("uri"));

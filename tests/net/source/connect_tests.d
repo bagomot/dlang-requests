@@ -401,6 +401,15 @@ unittest {
     // The test proxy answers anything but CONNECT with 405.
     assert(rq.get(url).code == 405);
     assert(proxy.heads.length == 1 && proxy.heads[0].canFind("GET %s HTTP/1.1".format(url)), proxy.heads[0]);
+
+    // As a CGI program would get it from the Proxy header of a request; Windows tells no names apart by case.
+    version (Posix) {
+        environment.remove("http_proxy");
+        environment["HTTP_PROXY"] = "http://127.0.0.1:%d".format(proxy.port);
+        scope (exit) environment.remove("HTTP_PROXY");
+        assert(rq.get(url).code == 200);
+        assert(proxy.heads.length == 1);
+    }
 }
 
 @("a peer that hangs up while the request body goes out fails the request, and the process lives on")

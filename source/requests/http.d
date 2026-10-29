@@ -535,8 +535,8 @@ public struct HTTPRequest {
         }
         return a.data();
     }
-    /// The proxy for `scheme`: the one set, or with `useEnvironmentProxy` the one in `<scheme>_proxy` or `all_proxy`
-    /// (either case); null for none.
+    /// The proxy for `scheme`: the one set, or with `useEnvironmentProxy` the one in `<scheme>_proxy` or `all_proxy`,
+    /// in either case but for `http_proxy`; null for none.
     string select_proxy(string scheme) {
         // The proxy URL may hold credentials, so it is not traced.
         if ( _proxy ) {
@@ -546,7 +546,10 @@ public struct HTTPRequest {
         if ( _useEnvironmentProxy ) {
             import std.process : environment;
             foreach ( name; [scheme, "all"] ) {
-                auto p = environment.get(name ~ "_proxy", environment.get(name.toUpper() ~ "_PROXY"));
+                // A CGI program gets HTTP_PROXY from the Proxy header of the request it serves (httpoxy). On
+                // Windows, where names have no case, that is http_proxy too.
+                immutable upper = name == "http" ? null : environment.get(name.toUpper() ~ "_PROXY");
+                auto p = environment.get(name ~ "_proxy", upper);
                 if ( p.length > 0 ) {
                     debug(requests) tracef("proxy: from %s_proxy", name);
                     return p;
