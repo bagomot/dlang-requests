@@ -375,7 +375,12 @@ public struct Request {
     mixin(Getter_Setter!bool("useStreaming"));
     mixin(Getter_Setter!(RefCounted!Cookies)("cookie"));
     mixin(Getter_Setter!string("bind"));
-    mixin(Getter_Setter!(string[string])("headers"));
+    mixin(Getter("headers"));
+    /// Replaces the headers set so far with `headers`, as `clearHeaders` and then `addHeaders` do.
+    @property void headers(in string[string] headers) {
+        clearHeaders();
+        addHeaders(headers);
+    }
 
     /**
         Set and Get uri for next request.
@@ -455,6 +460,9 @@ public struct Request {
                 case "user-agent":
                     _userHeaders.UserAgent = true;
                     break;
+                case "accept-encoding":
+                    _userHeaders.AcceptEncoding = true;
+                    break;
                 case "content-length":
                     _userHeaders.ContentLength = true;
                     break;
@@ -479,6 +487,13 @@ public struct Request {
     void clearHeaders() {
         _headers = null;
         _userHeaders = _UH.init;
+    }
+    unittest {
+        Request rq;
+        rq.addHeaders(["User-Agent": "agent"]);
+        rq.headers = ["accept-encoding": "identity"];
+        assert(rq.headers == ["accept-encoding": "identity"]);
+        assert(rq.userHeaders.AcceptEncoding && !rq.userHeaders.UserAgent);
     }
     Response exec(string method="GET", A...)(string url, A args)
     {

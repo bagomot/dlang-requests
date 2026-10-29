@@ -520,6 +520,9 @@ public struct HTTPRequest {
             case "user-agent":
                 _userHeaders.UserAgent = true;
                 break;
+            case "accept-encoding":
+                _userHeaders.AcceptEncoding = true;
+                break;
             case "content-length":
                 _userHeaders.ContentLength = true;
                 break;
@@ -599,6 +602,16 @@ public struct HTTPRequest {
         _filteredHeaders.each!(h => generatedHeaders.remove(h));
 
         return generatedHeaders;
+    }
+    unittest {
+        HTTPRequest rq;
+        rq._cookie = RefCounted!Cookies(Cookies());
+        rq._uri = URI("http://origin.example/");
+        assert(rq.requestHeaders()["Accept-Encoding"] == "gzip,deflate");
+        rq.addHeaders(["accept-encoding": "identity", "user-agent": "agent"]);
+        auto h = rq.requestHeaders();
+        assert(h.byKey.map!asciiLower.array.sort.array == ["accept-encoding", "connection", "host", "user-agent"]);
+        assert(h["accept-encoding"] == "identity" && h["user-agent"] == "agent");
     }
     /**
      * The request target: the path and the query with `params`, or for an http request through a proxy the absolute
