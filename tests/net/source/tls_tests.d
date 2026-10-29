@@ -143,33 +143,6 @@ unittest {
     assert(atomicLoad(server.served) == 2);
 }
 
-/// The OpenSSL libraries of major version 4 or 3 in the process.
-private string[] loadedOpenSSL() {
-    string[] loaded;
-    foreach (major; [4, 3]) {
-        version (Windows) {
-            import core.sys.windows.windows : GetModuleHandleW;
-            import std.utf : toUTF16z;
-
-            foreach (name; ["libssl-%d-x64.dll".format(major), "libcrypto-%d-x64.dll".format(major)]) {
-                if (GetModuleHandleW(name.toUTF16z) !is null) {
-                    loaded ~= name;
-                }
-            }
-        } else version (linux) {
-            import core.sys.linux.dlfcn : dlclose, dlopen, RTLD_NOLOAD, RTLD_NOW;
-
-            foreach (name; ["libssl.so.%d".format(major), "libcrypto.so.%d".format(major)]) {
-                if (auto library = dlopen(name.toStringz, RTLD_NOW | RTLD_NOLOAD)) {
-                    dlclose(library);
-                    loaded ~= name;
-                }
-            }
-        }
-    }
-    return loaded;
-}
-
 version (RequestsOpenSSLStatic) {
 } else {
     /**

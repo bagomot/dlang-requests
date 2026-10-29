@@ -11,11 +11,11 @@ import core.thread : Thread;
 import core.time : Duration, MonoTime, msecs, seconds;
 import std.algorithm : canFind;
 import std.conv : to;
-import std.exception : enforce;
+import std.exception : collectException, enforce;
 import std.format : format;
 import std.path : buildPath, dirName;
 import std.socket;
-import std.string : indexOf, lastIndexOf, split, strip, toStringz;
+import std.string : indexOf, lastIndexOf, representation, split, strip, toStringz;
 import core.stdc.config : c_long;
 
 import requests;
@@ -33,6 +33,10 @@ version (RequestsOpenSSLStatic) {
 
 /// The argument that makes the test executable run `probeWithoutOpenSSL` instead of the tests.
 enum probeArgument = "--probe-without-openssl";
+
+/// The argument, followed by the ports of an HTTP server and an HTTPS one, that makes the test executable run
+/// `probeConcurrently` instead of the tests.
+enum concurrentProbeArgument = "--probe-concurrently";
 
 enum okResponse = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
 
@@ -79,6 +83,9 @@ abstract class LoopbackServer {
     private Thread thread;
     private shared bool stopping;
     private bool concurrent;
+    private Object guard;
+    private Thread[] servingApart;  // threads of the connections served apart
+    private Socket[] open;          // connections being served
     /// Connections accepted.
     shared int accepted;
     /// Connections accepted on ::1.
@@ -86,6 +93,7 @@ abstract class LoopbackServer {
 
     this(bool concurrent = false) {
         this.concurrent = concurrent;
+        guard = new Object();
         auto v4 = new TcpSocket(AddressFamily.INET);
         v4.bind(new InternetAddress("127.0.0.1", 0));
         v4.listen(8);
@@ -109,11 +117,37 @@ abstract class LoopbackServer {
         return listeners.length > 1;
     }
 
+    /// Stops accepting, ends the connections still served and waits for their threads.
     void stop() {
         atomicStore(stopping, true);
+        endOpen();
         thread.join();
         foreach (l; listeners) {
             l.close();
+        }
+        // One accepted while the first pass ran.
+        endOpen();
+        Thread[] serving;
+        synchronized (guard) {
+            serving = servingApart.dup;
+        }
+        foreach (t; serving) {
+            t.join();
+        }
+    }
+
+    private void endOpen() {
+        synchronized (guard) {
+            // Wakes a thread waiting to receive: on Linux a shutdown does, on Windows cancelling its I/O. Closing the
+            // socket from here instead might close a handle the system has given to another socket meanwhile.
+            foreach (c; open) {
+                collectException(c.shutdown(SocketShutdown.BOTH));
+                version (Windows) {
+                    import core.sys.windows.windows : CancelIoEx, HANDLE;
+
+                    CancelIoEx(cast(HANDLE) c.handle, null);
+                }
+            }
         }
     }
 
@@ -145,6 +179,16 @@ abstract class LoopbackServer {
     }
 
     private void run() {
+        // OpenSSL writes to the socket without MSG_NOSIGNAL, and a client may be gone, or the connection shut down by
+        // `stop`, by then. The threads this one starts block SIGPIPE too; those of the clients don't.
+        version (linux) {
+            import core.sys.posix.signal : pthread_sigmask, sigaddset, sigemptyset, sigset_t, SIG_BLOCK, SIGPIPE;
+
+            sigset_t pipe;
+            sigemptyset(&pipe);
+            sigaddset(&pipe, SIGPIPE);
+            pthread_sigmask(SIG_BLOCK, &pipe, null);
+        }
         auto set = new SocketSet();
         while (!atomicLoad(stopping)) {
             set.reset();
@@ -159,6 +203,9 @@ abstract class LoopbackServer {
                     continue;
                 }
                 auto c = l.accept();
+                synchronized (guard) {
+                    open ~= c;
+                }
                 atomicOp!"+="(accepted, 1);
                 if (i > 0) {
                     atomicOp!"+="(acceptedInet6, 1);
@@ -179,25 +226,35 @@ abstract class LoopbackServer {
             serve(c);
         } catch (Exception) {
         }
+        // Out of the list before it closes, so that `stop` never shuts down a handle the system has reused.
+        synchronized (guard) {
+            import std.algorithm : remove;
+
+            open = open.remove!(o => o is c);
+        }
         c.close();
     }
 
     private void serveApart(Socket c) {
         auto t = new Thread({ serveAndClose(c); });
         t.isDaemon = true;
+        synchronized (guard) {
+            servingApart ~= t;
+        }
         t.start();
     }
 }
 
 final class PlainServer : LoopbackServer {
+    /// Requests answered, counted before the answer goes, so that the client sees the count when it has the answer.
     shared int served;
 
     protected override void serve(Socket c) {
         if (readHead(b => c.receive(b)) is null) {
             return;
         }
-        c.send(okResponse);
         atomicOp!"+="(served, 1);
+        c.send(okResponse);
     }
 }
 
@@ -275,6 +332,141 @@ string targetOf(string head) {
     return line.length == 3 ? line[1] : null;
 }
 
+/// A redirect with status `code` to `location`.
+string redirect(int code, string location) {
+    return "HTTP/1.1 %d Redirect\r\nLocation: %s\r\nContent-Length: 0\r\n\r\n".format(code, location);
+}
+
+/// Sends all of `data`; false when the client goes first.
+bool sendAll(Socket c, const(char)[] data) {
+    while (data.length) {
+        immutable n = c.send(data);
+        if (n <= 0) {
+            return false;
+        }
+        data = data[n .. $];
+    }
+    return true;
+}
+
+/// A response with `content`, its Content-Length and `fields`, each a header line without its end.
+string response(string content, string[] fields = null, string status = "200 OK") {
+    return "HTTP/1.1 %s\r\n%-(%s\r\n%|%)Content-Length: %d\r\n\r\n".format(status, fields, content.length) ~ content;
+}
+
+/// `content` in chunks of `size`, with the last chunk.
+string chunked(string content, size_t size) {
+    import std.range : chunks;
+
+    string r;
+    foreach (chunk; content.representation.chunks(size)) {
+        r ~= "%x\r\n%s\r\n".format(chunk.length, cast(string) chunk);
+    }
+    return r ~ "0\r\n\r\n";
+}
+
+/// The data of chunked body `content`, chunk extensions and trailer fields left out.
+string dechunk(string content) {
+    string data;
+    for (;;) {
+        immutable lineEnd = content.indexOf("\r\n");
+        enforce(lineEnd > 0, "no chunk size line in %(%s%)".format([content]));
+        immutable size = content[0 .. lineEnd].split(';')[0].strip.to!size_t(16);
+        content = content[lineEnd + 2 .. $];
+        if (size == 0) {
+            return data;
+        }
+        enforce(content.length >= size + 2 && content[size .. size + 2] == "\r\n", "a malformed chunk");
+        data ~= content[0 .. size];
+        content = content[size + 2 .. $];
+    }
+}
+
+/// A request as it came to a server.
+struct Received {
+    string head;     /// the request line and the header fields, up to the empty line
+    string content;  /// the body as it came, chunked or not
+    string peer;     /// the client's address
+
+    string method() const {
+        return head[0 .. head.indexOf(' ')];
+    }
+
+    string target() const {
+        return targetOf(head);
+    }
+
+    /// The values of header `name`, in any case.
+    string[] values(string name) const {
+        import std.uni : sicmp;
+
+        string[] r;
+        foreach (line; head.split("\r\n")[1 .. $]) {
+            immutable colon = line.indexOf(':');
+            if (colon > 0 && sicmp(line[0 .. colon], name) == 0) {
+                r ~= line[colon + 1 .. $].strip;
+            }
+        }
+        return r;
+    }
+
+    /// The value of header `name`, in any case; null without one.
+    string header(string name) const {
+        auto v = values(name);
+        return v.length ? v[0] : null;
+    }
+
+    /// The body, its chunks decoded.
+    string payload() const {
+        return header("Transfer-Encoding") == "chunked" ? dechunk(content) : content;
+    }
+}
+
+/**
+ * Answers each request on a connection with `answer`, until the client closes it, the answer is null or it says
+ * `Connection: close`; keeps every request it was sent. Each connection has a thread of its own, so that one a client
+ * keeps open doesn't hold up the next.
+ */
+final class HttpServer : LoopbackServer {
+    alias Answer = string delegate(Received request);
+    private Answer answer;
+    private Received[] _received;
+    shared int served;
+
+    this(Answer answer) {
+        this.answer = answer;
+        super(true);
+    }
+
+    /// The requests so far.
+    Received[] received() {
+        synchronized (this) {
+            return _received.dup;
+        }
+    }
+
+    protected override void serve(Socket c) {
+        import std.uni : toLower;
+
+        immutable peer = c.remoteAddress.toAddrString;
+        for (auto head = readHead(b => c.receive(b)); head !is null; head = readHead(b => c.receive(b))) {
+            auto request = Received(head[0 .. head.indexOf("\r\n\r\n") + 4], readBody(c, head), peer);
+            synchronized (this) {
+                _received ~= request;
+            }
+            atomicOp!"+="(served, 1);
+            immutable r = answer(request);
+            if (r is null || !sendAll(c, r)) {
+                return;
+            }
+            immutable end = r.indexOf("\r\n\r\n");
+            if (end >= 0 && r[0 .. end].toLower.canFind("\r\nconnection: close")) {
+                return;
+            }
+        }
+    }
+}
+
 /// Whether `head` has a header line `name: value` for some value, `name` in any case.
 bool hasHeader(string head, string name) {
     import std.uni : toLower;
@@ -323,6 +515,8 @@ private struct ServerSsl {
         void function(void*, int) SSL_CTX_set_security_level;
         int function(void*, const(char)*, int) SSL_CTX_use_certificate_file;
         int function(void*, const(char)*, int) SSL_CTX_use_PrivateKey_file;
+        int function(void*, const(char)*, const(char)*) SSL_CTX_load_verify_locations;
+        void function(void*, int, void*) SSL_CTX_set_verify;
         void function(void*) SSL_CTX_free;
         void* function(void*) SSL_new;
         int function(void*, int) SSL_set_fd;
@@ -342,6 +536,8 @@ version (RequestsOpenSSLStatic) {
         void SSL_CTX_set_security_level(void*, int);
         int SSL_CTX_use_certificate_file(void*, const(char)*, int);
         int SSL_CTX_use_PrivateKey_file(void*, const(char)*, int);
+        int SSL_CTX_load_verify_locations(void*, const(char)*, const(char)*);
+        void SSL_CTX_set_verify(void*, int, void*);
         void SSL_CTX_free(void*);
         void* SSL_new(void*);
         int SSL_set_fd(void*, int);
@@ -402,30 +598,49 @@ private __gshared ServerSsl serverSsl;
 
 /// What a `TlsServer` does after the handshake.
 enum TlsBehavior {
-    respond,  /// read the request head and answer `okResponse`
+    respond,  /// read the request head and answer it
     hangUp,   /// hang up on the client, see `hangUp`
 }
 
 enum TLS1_1_VERSION = 0x0302;
 
+/// Serves one request on each connection over TLS.
 final class TlsServer : LoopbackServer {
+    /// Requests answered, counted as `PlainServer.served`.
     shared int served;
     private void* ctx;
     private TlsBehavior behavior;
-    private string response;
+    private string delegate(string head) answer;
+    private string[] _heads;
 
     /**
      * Serves `certName`.pem, issued for `server.key`, answering a request with `response`; with `maxVersion`, such as
      * `TLS1_1_VERSION`, no newer TLS version than that, at OpenSSL's security level 0, which allows TLS 1.1.
      */
     this(string certName, TlsBehavior behavior = TlsBehavior.respond, string response = okResponse, int maxVersion = 0) {
+        this.behavior = behavior;
+        answer = (string head) => response;
+        setUp(certName, maxVersion, null);
+        super();
+    }
+
+    /**
+     * Serves `certName`.pem, answering a request with `answer` of its head, as many at a time as come when `concurrent`;
+     * with `clientCa`, only to a client whose certificate the CA in that file issued.
+     */
+    this(string certName, string delegate(string head) answer, bool concurrent = false, string clientCa = null) {
+        this.answer = answer;
+        setUp(certName, 0, clientCa);
+        super(concurrent);
+    }
+
+    private void setUp(string certName, int maxVersion, string clientCa) {
         enum filetypePem = 1;
         enum SSL_CTRL_SET_MAX_PROTO_VERSION = 124;
+        enum SSL_VERIFY_PEER = 1, SSL_VERIFY_FAIL_IF_NO_PEER_CERT = 2;
         if (serverSsl.SSL_new is null) {
             serverSsl = loadServerSsl();
         }
-        this.behavior = behavior;
-        this.response = response;
         ctx = serverSsl.SSL_CTX_new(serverSsl.TLS_server_method());
         enforce(ctx !is null);
         enforce(serverSsl.SSL_CTX_use_certificate_file(ctx, cert(certName ~ ".pem").toStringz, filetypePem) == 1);
@@ -434,12 +649,22 @@ final class TlsServer : LoopbackServer {
             serverSsl.SSL_CTX_set_security_level(ctx, 0);
             enforce(serverSsl.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MAX_PROTO_VERSION, maxVersion, null) == 1);
         }
-        super();
+        if (clientCa !is null) {
+            enforce(serverSsl.SSL_CTX_load_verify_locations(ctx, clientCa.toStringz, null) == 1);
+            serverSsl.SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, null);
+        }
     }
 
     override void stop() {
         super.stop();
         serverSsl.SSL_CTX_free(ctx);
+    }
+
+    /// The head of every request so far.
+    string[] heads() {
+        synchronized (this) {
+            return _heads.dup;
+        }
     }
 
     protected override void serve(Socket c) {
@@ -451,12 +676,22 @@ final class TlsServer : LoopbackServer {
         }
         final switch (behavior) {
             case TlsBehavior.respond:
-                if (readHead(b => serverSsl.SSL_read(ssl, b.ptr, cast(int) b.length)) is null) {
+                immutable head = readHead(b => serverSsl.SSL_read(ssl, b.ptr, cast(int) b.length));
+                if (head is null) {
                     return;
                 }
-                serverSsl.SSL_write(ssl, response.ptr, cast(int) response.length);
-                serverSsl.SSL_shutdown(ssl);
+                synchronized (this) {
+                    _heads ~= head;
+                }
                 atomicOp!"+="(served, 1);
+                for (const(char)[] r = answer(head); r.length;) {
+                    immutable n = serverSsl.SSL_write(ssl, r.ptr, cast(int) r.length);
+                    if (n <= 0) {
+                        return;
+                    }
+                    r = r[n .. $];
+                }
+                serverSsl.SSL_shutdown(ssl);
                 break;
             case TlsBehavior.hangUp:
                 hangUp(c);
@@ -626,6 +861,33 @@ ushort closedPort() {
     return (cast(InternetAddress) s.localAddress).port;
 }
 
+/// The OpenSSL libraries of major version 4 or 3 in the process.
+string[] loadedOpenSSL() {
+    string[] loaded;
+    foreach (major; [4, 3]) {
+        version (Windows) {
+            import core.sys.windows.windows : GetModuleHandleW;
+            import std.utf : toUTF16z;
+
+            foreach (name; ["libssl-%d-x64.dll".format(major), "libcrypto-%d-x64.dll".format(major)]) {
+                if (GetModuleHandleW(name.toUTF16z) !is null) {
+                    loaded ~= name;
+                }
+            }
+        } else version (linux) {
+            import core.sys.linux.dlfcn : dlclose, dlopen, RTLD_NOLOAD, RTLD_NOW;
+
+            foreach (name; ["libssl.so.%d".format(major), "libcrypto.so.%d".format(major)]) {
+                if (auto library = dlopen(name.toStringz, RTLD_NOW | RTLD_NOLOAD)) {
+                    dlclose(library);
+                    loaded ~= name;
+                }
+            }
+        }
+    }
+    return loaded;
+}
+
 /// The CPU time the calling thread has used.
 Duration threadCpuTime() {
     import core.time : hnsecs, nsecs;
@@ -678,6 +940,15 @@ void within(Duration took, Duration limit, string file = __FILE__, size_t line =
 /// Asserts that a call spent its time waiting rather than spinning.
 void idle(Duration wall, Duration cpu, string file = __FILE__, size_t line = __LINE__) {
     enforce(cpu * 4 < wall, "used %s of CPU in %s".format(cpu, wall), file, line);
+}
+
+/// Asserts that `call` fails with a RequestException of `cause`, and returns it.
+RequestException expectFailure(RequestCause cause, scope void delegate() call,
+        string file = __FILE__, size_t line = __LINE__) {
+    auto e = collectException!RequestException(call());
+    enforce(e !is null, "no RequestException", file, line);
+    enforce(e.cause == cause, "%s instead of %s: %s".format(e.cause, cause, e.msg), file, line);
+    return e;
 }
 
 Request client() {

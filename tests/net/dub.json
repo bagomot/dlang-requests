@@ -1,6 +1,6 @@
 {
 	"name": "net-tests",
-	"description": "Tests of requests over the network, against local servers only: TLS, connection set-up, time limits, errors, redirects, response parsing and limits. Run with dub test",
+	"description": "Tests of requests over the network, against local servers only: what requests send and make of responses, TLS, connection set-up, time limits, errors, redirects, response parsing and limits. Run with dub test",
 	"license": "BSL-1.0",
 	"targetType": "library",
 	"dependencies": {

@@ -8,6 +8,7 @@ import requests;
 import requests.ssl_adapter : openssl;
 import support;
 import connect_tests;
+import http_tests;
 import security_tests;
 import tls_tests;
 
@@ -15,6 +16,8 @@ shared static this() {
     import core.runtime : Runtime, UnitTestResult;
 
     Runtime.extendedModuleUnitTester = () {
+        import std.algorithm : countUntil;
+        import std.conv : to;
         import std.stdio : writefln;
 
         version (RequestsOpenSSLStatic) {
@@ -24,13 +27,19 @@ shared static this() {
                 return UnitTestResult(1, passed ? 1 : 0, false, false);
             }
         }
+        immutable concurrent = Runtime.args.countUntil(concurrentProbeArgument);
+        if (concurrent >= 0) {
+            immutable passed = probeConcurrently(Runtime.args[concurrent + 1].to!ushort,
+                Runtime.args[concurrent + 2].to!ushort);
+            return UnitTestResult(1, passed ? 1 : 0, false, false);
+        }
         try {
             writefln("%s, %s", openssl.versionText, linkage);
         } catch (OpenSSLUnavailableException e) {
             writefln("OpenSSL is unavailable: %s", e.msg);
         }
         UnitTestResult result;
-        static foreach (m; AliasSeq!(tls_tests, connect_tests, security_tests)) {
+        static foreach (m; AliasSeq!(tls_tests, connect_tests, security_tests, http_tests)) {
             static foreach (test; __traits(getUnitTests, m)) {
                 ++result.executed;
                 try {

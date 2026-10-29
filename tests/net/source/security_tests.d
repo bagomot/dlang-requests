@@ -19,25 +19,12 @@ import std.string : representation;
 import requests;
 import support;
 
-/// Asserts that `call` fails with a RequestException of `cause`, and returns it.
-private RequestException expectFailure(RequestCause cause, scope void delegate() call,
-        string file = __FILE__, size_t line = __LINE__) {
-    auto e = collectException!RequestException(call());
-    enforce(e !is null, "no RequestException", file, line);
-    enforce(e.cause == cause, "%s instead of %s: %s".format(e.cause, cause, e.msg), file, line);
-    return e;
-}
-
 /// A server that reads the body of each request by its Content-Length and answers `answer(target)`.
 private ScriptedServer serving(string delegate(string target) answer) {
     return new ScriptedServer((Socket c, ScriptedServer s) {
         readBody(c, lastHead);
         c.send(answer(targetOf(lastHead)));
     });
-}
-
-private string redirect(int code, string location) {
-    return "HTTP/1.1 %d Redirect\r\nLocation: %s\r\nContent-Length: 0\r\n\r\n".format(code, location);
 }
 
 /// An authenticator whose header is easy to find.
