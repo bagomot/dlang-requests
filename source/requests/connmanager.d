@@ -14,8 +14,8 @@ import cachetools.cache;
 
 /**
  * Keep opened connections for HTTP.
- * It is actually cache over tuple(schema, host, port, proxy) -> connection
- * with limited number of items.
+ * It is actually cache over tuple(schema, host, port, setup) -> connection
+ * with limited number of items, where setup tells what else the connection depends on, such as the proxy.
  *
  * Evict least used.
 */
@@ -44,12 +44,12 @@ package struct ConnManager {
     /// If nothing evicted return null. Returned(evicted) connection can be
     /// closed.
     ///
-    NetworkStream put(string schema, string host, ushort port, string proxy, NetworkStream stream)
+    NetworkStream put(string schema, string host, ushort port, string setup, NetworkStream stream)
     in { assert(stream !is null);}
     out{ assert(__cache.length>0);}
     do {
         NetworkStream e;
-        CMKey     key = CMKey(schema, host, port, proxy);
+        CMKey     key = CMKey(schema, host, port, setup);
         CMValue value = {stream: stream, timestamp: Clock.currTime};
         __cache.put(key, value);
         auto cacheEvents = __cache.cacheEvents();
@@ -66,11 +66,11 @@ package struct ConnManager {
     /**
         Lookup connection.
      */
-    NetworkStream get(string schema, string host, ushort port, string proxy)
+    NetworkStream get(string schema, string host, ushort port, string setup)
     do
     {
         if ( __cache is null ) return null;
-        auto v = __cache.get(CMKey(schema, host, port, proxy));
+        auto v = __cache.get(CMKey(schema, host, port, setup));
         if ( ! v.isNull() )
         {
             return v.get.stream;
@@ -81,9 +81,9 @@ package struct ConnManager {
     /**
         Remove connection from cache (without close).
      */
-    NetworkStream del(string schema, string host, ushort port, string proxy) {
+    NetworkStream del(string schema, string host, ushort port, string setup) {
         NetworkStream s;
-        CMKey key = CMKey(schema, host, port, proxy);
+        CMKey key = CMKey(schema, host, port, setup);
         __cache.remove(key);
         auto cacheEvents = __cache.cacheEvents();
         switch( cacheEvents.length )
@@ -117,7 +117,6 @@ package struct ConnManager {
                 debug(requests) tracef("%s while clear connmanager", e.msg);
             }
         }
-        __cache = null;
     }
 }
 
@@ -159,4 +158,8 @@ unittest {
 
     cm.clear();
     assert(cm.get("http", "s1", 1, null) is null);
+    // and it serves on
+    auto s5 = new TCPStream;
+    assert(cm.put("http", "s5", 1, null, s5) is null && cm.get("http", "s5", 1, null) == s5);
+    assert(cm.del("http", "s5", 1, null) == s5 && cm.get("http", "s5", 1, null) is null);
 }

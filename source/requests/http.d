@@ -974,6 +974,46 @@ public struct HTTPRequest {
         l.lowSpeedTime = _lowSpeedTime;
         return l;
     }
+    /**
+     * What a connection to the origin of `_uri` depends on besides its scheme, host and port, so that one is taken from
+     * the cache only for a request that would set it up the same way: the socket factory, the proxy, the local address,
+     * the address family and, over https, how the server is verified and the client certificate.
+     */
+    private string connectionSetup() {
+        immutable factory = _socketFactory is null ? "" : "%s/%s".format(_socketFactory.ptr, _socketFactory.funcptr);
+        string[] setup = [factory, select_proxy(_uri.scheme), _bind, _ipFamily.to!string];
+        if ( _uri.scheme == "https" ) {
+            setup ~= [_sslOptions.getVerifyPeer.to!string, _sslOptions.getCaCert, _sslOptions.getKeyFile,
+                _sslOptions.getKeyType.to!string, _sslOptions.getCertFile, _sslOptions.getCertType.to!string];
+        }
+        // Quoted, so that no value can pass for two.
+        return setup.to!string;
+    }
+    unittest {
+        HTTPRequest rq;
+        rq._uri = URI("https://origin.example/");
+        immutable plain = rq.connectionSetup();
+        alias Change = void delegate(ref HTTPRequest);
+        Change[] changes = [
+            (ref HTTPRequest r) { r.sslSetVerifyPeer(false); },
+            (ref HTTPRequest r) { r.sslSetCaCert("ca.pem"); },
+            (ref HTTPRequest r) { r.sslSetKeyFile("client.key"); },
+            (ref HTTPRequest r) { r.sslSetCertFile("client.pem"); },
+            (ref HTTPRequest r) { r._bind = "127.0.0.2"; },
+            (ref HTTPRequest r) { r._ipFamily = IPFamily.inet; },
+            (ref HTTPRequest r) { r._proxy = "http://127.0.0.1:3128"; },
+            (ref HTTPRequest r) { r._socketFactory = (string scheme, string host, ushort port) => NetworkStream.init; },
+        ];
+        foreach ( change; changes ) {
+            auto changed = rq;
+            change(changed);
+            assert(changed.connectionSetup() != plain);
+        }
+        rq._uri = URI("http://origin.example/");
+        auto verifying = rq;
+        verifying.sslSetVerifyPeer(false);
+        assert(verifying.connectionSetup() == rq.connectionSetup());
+    }
     ///
     /// Setup connection. Handle proxy and https case
     ///
@@ -989,7 +1029,7 @@ public struct HTTPRequest {
         if ( stream is null ) {
             stream = connect();
         }
-        if ( auto purged_connection = _cm.put(_uri.scheme, _uri.host, _uri.port, select_proxy(_uri.scheme), stream) ) {
+        if ( auto purged_connection = _cm.put(_uri.scheme, _uri.host, _uri.port, connectionSetup(), stream) ) {
             debug(requests) tracef("closing purged connection %s", purged_connection);
             purged_connection.close();
         }
@@ -1139,10 +1179,10 @@ public struct HTTPRequest {
         // The range outlives this request.
         auto incoming = _incoming;
         auto response = _response;
-        immutable scheme = _uri.scheme, host = _uri.host, port = _uri.port, proxy = select_proxy(_uri.scheme);
+        immutable scheme = _uri.scheme, host = _uri.host, port = _uri.port, setup = connectionSetup();
         immutable keep = keepsConnection();
         bool finished;
-        _cm.del(scheme, host, port, proxy);
+        _cm.del(scheme, host, port, setup);
 
         RequestException failure(RequestCause cause, string message, Throwable next) {
             finished = true;
@@ -1190,7 +1230,7 @@ public struct HTTPRequest {
                 incoming.decoder.flush();
                 finished = true;
                 if ( keep && incoming.framed && !incoming.surplus ) {
-                    if ( auto purged = response.receiveAsRange.cm.put(scheme, host, port, proxy, incoming.stream) ) {
+                    if ( auto purged = response.receiveAsRange.cm.put(scheme, host, port, setup, incoming.stream) ) {
                         purged.close();
                     }
                 } else {
@@ -1444,11 +1484,11 @@ public struct HTTPRequest {
             _response._startedAt = Clock.currTime;
             auto outgoing = compose();
 
-            immutable proxy = select_proxy(_uri.scheme);
-            auto _stream = _cm.get(_uri.scheme, _uri.host, _uri.port, proxy);
+            immutable setup = connectionSetup();
+            auto _stream = _cm.get(_uri.scheme, _uri.host, _uri.port, setup);
             if ( _stream !is null && !_stream.isConnected ) {
                 debug(requests) trace("disconnected stream in the cache");
-                _cm.del(_uri.scheme, _uri.host, _uri.port, proxy);
+                _cm.del(_uri.scheme, _uri.host, _uri.port, setup);
                 _stream.close();
                 _stream = null;
             }
@@ -1473,7 +1513,7 @@ public struct HTTPRequest {
                 return _stream;
             } catch (Exception e) {
                 // What is left of the exchange would be read as the next response.
-                _cm.del(_uri.scheme, _uri.host, _uri.port, proxy);
+                _cm.del(_uri.scheme, _uri.host, _uri.port, setup);
                 _stream.close();
                 if ( auto ne = cast(NetworkException) e ) {
                     // A server may close a kept-alive connection just as the request goes out.

@@ -784,6 +784,19 @@ unittest {
     enforce(e !is null && e.stage == ConnectStage.tcp && e.cause == ConnectCause.local,
         e is null ? "connected" : "%s/%s: %s".format(e.stage, e.cause, e.msg));
     enforce(atomicLoad(server.accepted) == 1);
+
+    // A kept-alive connection serves only a request that would set it up the same way.
+    auto kept = client();
+    kept.keepAlive = true;
+    kept.bind = "127.0.0.1";
+    kept.get(url);
+    kept.bind = "127.0.0.2";
+    kept.get(url);
+    kept.bind = "127.0.0.1";
+    kept.get(url);
+    enforce(server.received[1 .. $].map!(r => r.peer).array == ["127.0.0.1", "127.0.0.2", "127.0.0.1"]
+        && atomicLoad(server.accepted) == 3, "%s, %d connections"
+        .format(server.received.map!(r => r.peer), atomicLoad(server.accepted)));
 }
 
 @("a connection from the socket factory carries the request")
@@ -801,6 +814,21 @@ unittest {
     enforce(rq.get("http://origin.test/b").responseBody.toString == "GET /b\n");
     enforce(asked == ["http://origin.test:80"], "%s".format(asked));
     enforce(server.received[0].header("Host") == "origin.test" && atomicLoad(server.accepted) == 1, server.received[0].head);
+
+    // Without the factory the request goes where its URL says, not over the factory's connection.
+    auto direct = new HttpServer((Received r) => echo(r));
+    scope (exit) direct.stop();
+    rq.socketFactory = null;
+    enforce(rq.get("http://127.0.0.1:%d/c".format(direct.port)).responseBody.toString == "GET /c
+");
+    rq.socketFactory = (string scheme, string host, ushort port) {
+        asked ~= "%s://%s:%d".format(scheme, host, port);
+        return cast(NetworkStream) new TCPStream().connect("127.0.0.1", server.port, NetworkLimits.init);
+    };
+    enforce(rq.get("http://127.0.0.1:%d/d".format(direct.port)).responseBody.toString == "GET /d
+");
+    enforce(atomicLoad(direct.accepted) == 1 && atomicLoad(server.accepted) == 2 && asked.length == 2,
+        "%d direct, %d from the factory, asked %s".format(atomicLoad(direct.accepted), atomicLoad(server.accepted), asked));
 }
 
 @("a server that asks for a client certificate takes the one set and no client without one, and a key that can't be loaded is a local failure")
