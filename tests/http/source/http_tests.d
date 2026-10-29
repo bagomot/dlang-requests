@@ -430,7 +430,8 @@ unittest {
     info("Check exception handling, error messages and timeouts are OK");
     rq.clearHeaders();
     rq.timeout = 1.seconds;
-    assertThrown!TimeoutException(rq.get(httpbinUrl ~ "delay/3"));
+    auto timedOut = collectException!RequestException(rq.get(httpbinUrl ~ "delay/3"));
+    assert(timedOut !is null && timedOut.cause == RequestCause.timeout && timedOut.bytesReceived == 0);
 
     info("Test ByLine interfaces");
     auto rsp = getContentByLine(httpbinUrl ~ "stream/50");

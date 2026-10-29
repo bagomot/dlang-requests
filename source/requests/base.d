@@ -205,10 +205,20 @@ public struct MultipartForm {
 }
 ///
 
-/// General type exception from Request
+/// A request failed after its connection was set up: the transfer broke, or the response can't be used.
 public class RequestException: Exception {
-    this(string msg, string file = __FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
+    immutable RequestCause cause;
+    /// The host of the request.
+    immutable string host;
+    /// How much of the failed response arrived, headers included.
+    immutable ulong bytesReceived;
+
+    this(RequestCause cause, string host, ulong bytesReceived, string msg,
+            string file = __FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
         super(msg, file, line, next);
+        this.cause = cause;
+        this.host = host;
+        this.bytesReceived = bytesReceived;
     }
 }
 

@@ -53,8 +53,38 @@ $(TABLE
  $(TR
   $(TD timeout)
   $(TD `Duration`)
-  $(TD timeout on connect or data transfer)
+  $(TD longest wait in sending or receiving)
   $(TD `30.seconds`)
+ )
+ $(TR
+  $(TD connectTimeout)
+  $(TD `Duration`)
+  $(TD resolving and connecting, all addresses together)
+  $(TD `30.seconds`)
+ )
+ $(TR
+  $(TD handshakeTimeout)
+  $(TD `Duration`)
+  $(TD whole TLS handshake, proxy's answer to `CONNECT`)
+  $(TD `30.seconds`)
+ )
+ $(TR
+  $(TD deadline)
+  $(TD `Duration`)
+  $(TD whole request)
+  $(TD `0` - none)
+ )
+ $(TR
+  $(TD lowSpeedLimit, lowSpeedTime)
+  $(TD `size_t`, `Duration`)
+  $(TD lowest receiving speed, bytes a second over a time)
+  $(TD `0` - off)
+ )
+ $(TR
+  $(TD ipFamily)
+  $(TD `IPFamily`)
+  $(TD address families to connect to)
+  $(TD `IPFamily.any`)
  )
  $(TR
   $(TD proxy)
@@ -230,8 +260,18 @@ public struct Request {
         /// content type for POST/PUT requests
         string                  _contentType;                     // content type for POST/PUT payloads
 
-        /// timeout for connect/send/receive
+        /// timeout for each wait in sending and receiving
         Duration                _timeout = 30.seconds;
+
+        /// time limits of the request's phases, zero for none
+        Duration                _connectTimeout = 30.seconds;
+        Duration                _handshakeTimeout = 30.seconds;
+        Duration                _deadline;
+        size_t                  _lowSpeedLimit;
+        Duration                _lowSpeedTime;
+
+        /// address families to connect to
+        IPFamily                _ipFamily;
 
         /// verify peer when using ssl
         bool                    _sslSetVerifyPeer = true;
@@ -277,11 +317,30 @@ public struct Request {
         //
 
     }
-    /** Get/Set timeout on connection and IO operation.
-     *  **v** - timeout value
-     *  If timeout expired Request operation will throw $(B TimeoutException).
+    /** Get/Set the longest wait for sending to progress or for data of the response to arrive; zero for none.
+     *  When it runs out the request throws $(B RequestException) with `RequestCause.timeout`.
      */
     mixin(Getter_Setter!Duration("timeout"));
+    /** Get/Set the time to resolve the host name and connect over TCP, all addresses together; zero for none.
+     *  Addresses are tried in turn, each in an equal share of what is left. When it runs out the request throws
+     *  $(B ConnectError) with `ConnectCause.timeout`.
+     */
+    mixin(Getter_Setter!Duration("connectTimeout"));
+    /** Get/Set the time for the whole TLS handshake, and for a proxy's answer to `CONNECT`; zero for none. */
+    mixin(Getter_Setter!Duration("handshakeTimeout"));
+    /** Get/Set the time for the whole request, its redirects and a streamed body included; zero, the default, for none.
+     *  When it passes after the connection is set up the request throws $(B RequestException) with `RequestCause.deadline`.
+     */
+    mixin(Getter_Setter!Duration("deadline"));
+    /** Get/Set the lowest receiving speed, in bytes a second over `lowSpeedTime` spent waiting for the response, a
+     *  streamed body included. Below it the request throws $(B RequestException) with `RequestCause.lowSpeed`. Off,
+     *  the default, while either is zero.
+     */
+    mixin(Getter_Setter!size_t("lowSpeedLimit"));
+    /// ditto
+    mixin(Getter_Setter!Duration("lowSpeedTime"));
+    /** Get/Set which addresses of a host name to connect to: IPv4 and IPv6, the default, or only one of them. */
+    mixin(Getter_Setter!IPFamily("ipFamily"));
     mixin(Getter_Setter!bool("keepAlive"));
     mixin(Getter_Setter!uint("maxRedirects"));
     mixin(Getter_Setter!size_t("maxContentLength"));

@@ -61,6 +61,7 @@ private extern (C) nothrow @nogc {
     uint OPENSSL_version_patch();
     const(char)* OpenSSL_version(int type);
     c_ulong ERR_get_error();
+    void ERR_clear_error();
     const(char)* ERR_reason_error_string(c_ulong e);
     int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM* param, const(char)* name, size_t namelen);
     void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM* param, uint flags);
@@ -96,6 +97,7 @@ private enum libcryptoFunctions = [
     "OPENSSL_version_patch",
     "OpenSSL_version",
     "ERR_get_error",
+    "ERR_clear_error",
     "ERR_reason_error_string",
     "X509_VERIFY_PARAM_set1_host",
     "X509_VERIFY_PARAM_set_hostflags",

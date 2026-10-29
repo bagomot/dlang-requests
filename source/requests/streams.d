@@ -17,33 +17,86 @@ import std.datetime;
 import std.socket;
 import core.stdc.errno;
 import core.stdc.string;
-import core.stdc.config : c_long;
+import core.stdc.config : c_long, c_ulong;
+
+import core.sync.condition : Condition;
+import core.sync.mutex : Mutex;
+import core.thread : Thread;
+import core.time : MonoTime;
 
 import requests.ssl_adapter : openssl, OpenSSL, SSL, SSL_CTX, X509_V_OK, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS;
 
 alias InDataHandler = DataPipeIface!ubyte;
 
+/// Which addresses of a host name a connection may use.
+public enum IPFamily {
+    any,    /// IPv4 and IPv6, in the resolver's order
+    inet,   /// IPv4 only
+    inet6,  /// IPv6 only
+}
+
+/// The phase of setting up a connection that failed.
+public enum ConnectStage {
+    resolve,       /// resolving the host name
+    tcp,           /// the TCP connection
+    proxyConnect,  /// the proxy's answer to `CONNECT`
+    tlsHandshake,  /// the TLS handshake
+}
+
+/// Why setting up a connection failed.
+public enum ConnectCause {
+    timeout,      /// the phase ran out of time
+    notFound,     /// the host name has no address of the allowed families
+    refused,      /// the peer refused the TCP connection
+    unreachable,  /// the network reported the peer unreachable
+    reset,        /// the peer reset the connection
+    closed,       /// the peer closed the connection before the phase was done
+    proxyStatus,  /// the proxy answered `CONNECT` with a status other than 2xx
+    certificate,  /// the peer's certificate failed verification
+    protocol,     /// the peer's answer broke the protocol: a malformed proxy answer, a TLS alert or error
+    local,        /// a failure on this machine: socket, bind, TLS context, CA file, client certificate or another OS error
+}
+
+/// Setting up a connection failed.
 public class ConnectError: Exception {
+    immutable ConnectStage stage;
+    immutable ConnectCause cause;
+    /// The host of the request, also when the phase that failed was talking to a proxy.
+    immutable string host;
+
+    this(ConnectStage stage, ConnectCause cause, string host, string message,
+            string file = __FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
+        super(message, file, line, next);
+        this.stage = stage;
+        this.cause = cause;
+        this.host = host;
+    }
+}
+
+/// Why a request failed after its connection was set up.
+public enum RequestCause {
+    timeout,   /// sending or receiving made no progress within the request's `timeout`
+    deadline,  /// the request's `deadline` passed
+    lowSpeed,  /// receiving stayed below `lowSpeedLimit` bytes a second for `lowSpeedTime`
+    reset,     /// the connection broke: reset by the peer, another socket error or a TLS error
+    closed,    /// the peer closed the connection before the response was complete
+    protocol,  /// the response is malformed: status line, headers, chunked or compressed body
+    limit,     /// the response is longer than `maxHeadersLength` or `maxContentLength`
+}
+
+package class DecodingException: Exception {
     this(string message, string file =__FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
         super(message, file, line, next);
     }
 }
 
-class DecodingException: Exception {
-    this(string message, string file =__FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
-        super(message, file, line, next);
-    }
-}
-
-public class TimeoutException: Exception {
-    this(string message, string file = __FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
-        super(message, file, line, next);
-    }
-}
-
+/// Sending to or receiving from a connected stream failed.
 public class NetworkException: Exception {
-    this(string message, string file = __FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
+    immutable RequestCause cause;
+
+    this(RequestCause cause, string message, string file = __FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
         super(message, file, line, next);
+        this.cause = cause;
     }
 }
 
@@ -821,10 +874,6 @@ shared static this() {
     ];
 }
 
-extern(C) {
-    int SSL_library_init();
-}
-
 enum SSL_VERIFY_PEER = 0x01;
 enum SSL_FILETYPE_PEM = 1;
 enum SSL_FILETYPE_ASN1 = 2;
@@ -858,32 +907,338 @@ unittest {
     assert(!isIpLiteral("1.2.3.4.test"));
 }
 
-public class OpenSslSocket : Socket {
-    //enum SSL_MODE_RELEASE_BUFFERS = 0x00000010L;
-    private const(OpenSSL)* api;
-    private SSL* ssl;
-    private SSL_CTX* ctx;
-    private bool verifyPeer;
-    private bool peerNameSet;
-    private bool ownsHandle = true;
+/// Time limits of a stream; a zero duration is no limit.
+public struct NetworkLimits {
+    /// Which addresses of the host name to connect to.
+    IPFamily family;
+    /// Resolving the host name and connecting over TCP, all addresses together.
+    Duration connectTimeout;
+    /// The TLS handshake.
+    Duration handshakeTimeout;
+    /// Each wait for sending to progress or for data to arrive.
+    Duration timeout;
+    /// When everything must be done.
+    MonoTime deadline = MonoTime.max;
+    /// Receiving fails when it gets fewer than `lowSpeedLimit` bytes a second over `lowSpeedTime` spent waiting for them.
+    size_t lowSpeedLimit;
+    /// ditto
+    Duration lowSpeedTime;
+}
 
-    private void initSsl(SSLOptions opts) {
+/// When `limit` from `now` runs out, or `deadline` if that comes first; with a zero `limit`, `deadline`.
+package MonoTime limitEnd(MonoTime now, Duration limit, MonoTime deadline) pure nothrow @nogc @safe {
+    if ( limit <= Duration.zero || limit >= deadline - now ) {
+        return deadline;
+    }
+    return now + limit;
+}
+
+unittest {
+    immutable now = MonoTime.currTime;
+    assert(limitEnd(now, Duration.zero, MonoTime.max) == MonoTime.max);
+    assert(limitEnd(now, 2.seconds, MonoTime.max) == now + 2.seconds);
+    assert(limitEnd(now, 2.seconds, now + 1.seconds) == now + 1.seconds);
+    assert(limitEnd(now, Duration.max, MonoTime.max) == MonoTime.max);
+}
+
+/// The error of the last failed socket call: WinSock reports it through `WSAGetLastError` and leaves `errno` alone.
+private int lastSocketErrorCode() @trusted nothrow @nogc {
+    version(Windows) {
+        import core.sys.windows.winsock2 : WSAGetLastError;
+        return WSAGetLastError();
+    } else {
+        return errno;
+    }
+}
+
+private bool wouldBlock(int error) pure nothrow @nogc @safe {
+    version(Windows) {
+        import core.sys.windows.winsock2 : WSAEWOULDBLOCK;
+        return error == WSAEWOULDBLOCK;
+    } else {
+        return error == EAGAIN || error == EWOULDBLOCK;
+    }
+}
+
+private bool interrupted(int error) pure nothrow @nogc @safe {
+    version(Windows) {
+        return false;
+    } else {
+        return error == EINTR;
+    }
+}
+
+/// What an OS error that ended a connection attempt says about the peer: anything not from the other side is `local`.
+private ConnectCause connectCause(int error) pure nothrow @nogc @safe {
+    version(Windows) {
+        import core.sys.windows.winsock2;
+        switch ( error ) {
+            case WSAECONNREFUSED:
+                return ConnectCause.refused;
+            case WSAENETUNREACH, WSAEHOSTUNREACH, WSAENETDOWN, WSAEHOSTDOWN:
+                return ConnectCause.unreachable;
+            case WSAETIMEDOUT:
+                return ConnectCause.timeout;
+            case WSAECONNRESET, WSAECONNABORTED, WSAENETRESET:
+                return ConnectCause.reset;
+            default:
+                return ConnectCause.local;
+        }
+    } else {
+        switch ( error ) {
+            case ECONNREFUSED:
+                return ConnectCause.refused;
+            case ENETUNREACH, EHOSTUNREACH, ENETDOWN, EHOSTDOWN:
+                return ConnectCause.unreachable;
+            case ETIMEDOUT:
+                return ConnectCause.timeout;
+            case ECONNRESET, ECONNABORTED, ENETRESET, EPIPE:
+                return ConnectCause.reset;
+            default:
+                return ConnectCause.local;
+        }
+    }
+}
+
+/// Waits until `s` can be read from or, with `write`, written to; false when `end` comes first.
+private bool waitReady(Socket s, bool write, MonoTime end) {
+    auto set = new SocketSet(1);
+    for (;;) {
+        set.reset();
+        set.add(s);
+        int n;
+        if ( end == MonoTime.max ) {
+            n = Socket.select(write ? null : set, write ? set : null, null);
+        } else {
+            immutable left = end - MonoTime.currTime;
+            if ( left <= Duration.zero ) {
+                return false;
+            }
+            n = Socket.select(write ? null : set, write ? set : null, null, left);
+        }
+        if ( n > 0 ) {
+            return true;
+        }
+        // 0 is a timeout, which a coarse clock can report a little early; -1 an interrupted wait.
+    }
+}
+
+/// Connects non-blocking `s` to `a` by `end`: 0 when connected, -1 when the time ran out, otherwise the OS error.
+private int connectSocket(Socket s, Address a, MonoTime end) {
+    try {
+        s.connect(a);
+    } catch (SocketOSException e) {
+        return e.errorCode != 0 ? e.errorCode : -1;
+    }
+    auto writable = new SocketSet(1);
+    auto failed = new SocketSet(1);
+    for (;;) {
+        writable.reset();
+        writable.add(s);
+        failed.reset();
+        failed.add(s);
+        int n;
+        if ( end == MonoTime.max ) {
+            n = Socket.select(null, writable, failed);
+        } else {
+            immutable left = end - MonoTime.currTime;
+            if ( left <= Duration.zero ) {
+                return -1;
+            }
+            n = Socket.select(null, writable, failed, left);
+        }
+        if ( n > 0 ) {
+            // Windows reports a failed connection only in the exception set, Posix as writable; both leave the error
+            // in SO_ERROR.
+            int error;
+            s.getOption(SocketOptionLevel.SOCKET, SocketOption.ERROR, error);
+            return error;
+        }
+    }
+}
+
+/**
+ * Resolves `host` to the addresses of `family` by `end`. An IP address literal is parsed at once; a name is resolved on
+ * a thread of its own, which is left to finish alone when the time runs out.
+ */
+private Address[] resolve(string host, ushort port, IPFamily family, MonoTime end) {
+    AddressFamily af = family == IPFamily.inet ? AddressFamily.INET :
+        family == IPFamily.inet6 ? AddressFamily.INET6 : AddressFamily.UNSPEC;
+    if ( isIpLiteral(host) ) {
+        Address a;
+        try {
+            a = parseAddress(host, port);
+        } catch (Exception e) {
+            throw new ConnectError(ConnectStage.resolve, ConnectCause.notFound, host, "not a valid IP address");
+        }
+        if ( af != AddressFamily.UNSPEC && a.addressFamily != af ) {
+            throw new ConnectError(ConnectStage.resolve, ConnectCause.notFound, host, "the IP address is of another family");
+        }
+        return [a];
+    }
+
+    static final class Lookup {
+        Mutex mutex;
+        Condition finished;
+        bool done;
+        Address[] addresses;
+        string error;
+    }
+    auto lookup = new Lookup;
+    lookup.mutex = new Mutex;
+    lookup.finished = new Condition(lookup.mutex);
+    auto resolver = new Thread({
+        Address[] addresses;
+        string error;
+        try {
+            foreach ( info; getAddressInfo(host, to!string(port), af, SocketType.STREAM, ProtocolType.TCP) ) {
+                addresses ~= info.address;
+            }
+        } catch (Exception e) {
+            error = e.msg;
+        }
+        synchronized (lookup.mutex) {
+            lookup.addresses = addresses;
+            lookup.error = error;
+            lookup.done = true;
+            lookup.finished.notify();
+        }
+    });
+    resolver.isDaemon = true;
+    resolver.start();
+    synchronized (lookup.mutex) {
+        while ( !lookup.done ) {
+            if ( end == MonoTime.max ) {
+                lookup.finished.wait();
+                continue;
+            }
+            immutable left = end - MonoTime.currTime;
+            if ( left <= Duration.zero || !lookup.finished.wait(left) && !lookup.done ) {
+                throw new ConnectError(ConnectStage.resolve, ConnectCause.timeout, host, "resolving the host name timed out");
+            }
+        }
+        if ( lookup.error !is null ) {
+            throw new ConnectError(ConnectStage.resolve, ConnectCause.notFound, host, "the host name is not resolved: " ~ lookup.error);
+        }
+        if ( lookup.addresses.length == 0 ) {
+            throw new ConnectError(ConnectStage.resolve, ConnectCause.notFound, host, "the host name has no address of the allowed families");
+        }
+        return lookup.addresses;
+    }
+}
+
+version(linux) {
+    import core.sys.posix.signal : pthread_sigmask, sigaddset, sigemptyset, sigismember, sigpending, sigset_t,
+        sigtimedwait, SIG_BLOCK, SIG_SETMASK, SIGPIPE;
+    import core.sys.posix.time : timespec;
+
+    /**
+     * Runs `call` with SIGPIPE blocked in this thread, so that OpenSSL's write() to a socket the peer has closed fails
+     * with EPIPE instead of ending the process. A SIGPIPE raised meanwhile is taken here, unless one was pending before.
+     */
+    private T withoutSigpipe(T)(scope T delegate() call) @trusted {
+        sigset_t pipe, old, pending;
+        sigemptyset(&pipe);
+        sigaddset(&pipe, SIGPIPE);
+        pthread_sigmask(SIG_BLOCK, &pipe, &old);
+        sigpending(&pending);
+        immutable pendingBefore = sigismember(&pending, SIGPIPE) == 1;
+        scope(exit) {
+            if ( !pendingBefore ) {
+                sigpending(&pending);
+                if ( sigismember(&pending, SIGPIPE) == 1 ) {
+                    timespec now;
+                    sigtimedwait(&pipe, null, &now);
+                }
+            }
+            pthread_sigmask(SIG_SETMASK, &old, null);
+        }
+        return call();
+    }
+} else {
+    // Windows has no SIGPIPE, and on macOS Phobos sets SO_NOSIGPIPE on every socket.
+    private T withoutSigpipe(T)(scope T delegate() call) {
+        return call();
+    }
+}
+
+/// The outcome of one attempt to send or receive without blocking.
+private struct Io {
+    enum Status {
+        done,       /// `length` bytes moved
+        wantRead,   /// to wait until the socket is readable
+        wantWrite,  /// to wait until the socket is writable
+        eof,        /// the peer has closed the connection
+        failed,     /// for the reason in `failure`
+    }
+    Status status;
+    size_t length;
+    string failure;
+}
+
+// SSL_get_error results.
+private enum SSL_ERROR_SSL = 1;
+private enum SSL_ERROR_WANT_READ = 2;
+private enum SSL_ERROR_WANT_WRITE = 3;
+private enum SSL_ERROR_SYSCALL = 5;
+private enum SSL_ERROR_ZERO_RETURN = 6;
+
+// How OpenSSL 3.0 through 4.1 packs a queued error: a system error is its OS code with the top bit set.
+private enum c_ulong ERR_SYSTEM_FLAG = 0x8000_0000;
+private enum c_ulong ERR_SYSTEM_MASK = 0x7FFF_FFFF;
+private enum ERR_LIB_OFFSET = 23;
+private enum c_ulong ERR_LIB_MASK = 0xFF;
+private enum c_ulong ERR_REASON_MASK = 0x7F_FFFF;
+private enum c_ulong ERR_LIB_SSL = 20;
+private enum c_ulong SSL_R_UNEXPECTED_EOF_WHILE_READING = 294;
+
+/// What a failed OpenSSL I/O call left behind, read right after it.
+private struct TlsFailure {
+    int code;        /// SSL_get_error
+    c_ulong queued;  /// the first error in the queue, 0 when there is none
+    int osError;     /// the socket's last error
+
+    /// The OS error behind the failure, 0 when there is none.
+    int systemError() const pure nothrow @nogc @safe {
+        if ( queued & ERR_SYSTEM_FLAG ) {
+            return cast(int)(queued & ERR_SYSTEM_MASK);
+        }
+        return code == SSL_ERROR_SYSCALL ? osError : 0;
+    }
+
+    /// Whether the peer closed the connection without a TLS close_notify.
+    bool unexpectedEof() const pure nothrow @nogc @safe {
+        if ( code == SSL_ERROR_SYSCALL ) {
+            return systemError() == 0;
+        }
+        return code == SSL_ERROR_SSL && (queued & ERR_SYSTEM_FLAG) == 0
+            && ((queued >> ERR_LIB_OFFSET) & ERR_LIB_MASK) == ERR_LIB_SSL
+            && (queued & ERR_REASON_MASK) == SSL_R_UNEXPECTED_EOF_WHILE_READING;
+    }
+}
+
+/// A TLS client session on a connected socket.
+private final class TlsSession {
+    private const(OpenSSL)* api;
+    private SSL_CTX* ctx;
+    private SSL* ssl;
+    private bool verifyPeer;
+
+    /// Sets up a session on `s` that sends `host` in SNI and verifies the peer's certificate for it unless `opts` say not to.
+    this(Socket s, SSLOptions opts, string host) {
         api = &openssl();
         ctx = api.SSL_CTX_new(api.TLS_client_method());
         if ( ctx is null ) {
-            throw new ConnectError("can't create a TLS context: %s".format(sslErrorReason()));
+            throw failedSetUp(host, "can't create a TLS context");
         }
-        scope(failure) {
-            api.SSL_CTX_free(ctx);
-            ctx = null;
-        }
+        scope(failure) free();
         verifyPeer = opts.getVerifyPeer();
         if ( verifyPeer ) {
             if ( opts.getCaCert() ) {
                 // A given CA file is the only trust anchor: the default paths would add the store of
                 // whichever OpenSSL build got loaded, and SSL_CERT_FILE/SSL_CERT_DIR.
                 if ( api.SSL_CTX_load_verify_locations(ctx, opts.getCaCert().toStringz(), null) != 1 ) {
-                    throw new ConnectError("can't load CA certificates from %s: %s".format(opts.getCaCert(), sslErrorReason()));
+                    throw failedSetUp(host, "can't load CA certificates from the CA file");
                 }
             } else {
                 api.SSL_CTX_set_default_verify_paths(ctx);
@@ -891,40 +1246,64 @@ public class OpenSslSocket : Socket {
             api.SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, null);
         }
         immutable keyFile = opts.getKeyFile();
-        immutable keyType = opts.getKeyType();
+        immutable keyType = ft2ssl[opts.getKeyType()];
         immutable certFile = opts.getCertFile();
-        immutable certType = opts.getCertType();
-        final switch(opts.haveFiles()) {
-            case 0b11:  // both files
-                api.SSL_CTX_use_PrivateKey_file(ctx,  keyFile.toStringz(), ft2ssl[keyType]);
-                api.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(),ft2ssl[certType]);
+        immutable certType = ft2ssl[opts.getCertType()];
+        // A PEM file may hold both the key and the certificate.
+        final switch ( opts.haveFiles() ) {
+            case 0b11:
+                useClientCertificate(host, keyFile, keyType, certFile, certType);
                 break;
-            case 0b01:  // key only
-                api.SSL_CTX_use_PrivateKey_file(ctx,  keyFile.toStringz(), ft2ssl[keyType]);
-                api.SSL_CTX_use_certificate_file(ctx, keyFile.toStringz(), ft2ssl[keyType]);
+            case 0b01:
+                useClientCertificate(host, keyFile, keyType, keyFile, keyType);
                 break;
-            case 0b10:  // cert only
-                api.SSL_CTX_use_PrivateKey_file(ctx,  certFile.toStringz(), ft2ssl[certType]);
-                api.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(), ft2ssl[certType]);
+            case 0b10:
+                useClientCertificate(host, certFile, certType, certFile, certType);
                 break;
             case 0b00:
                 break;
         }
-        //SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
-        //SSL_CTX_ctrl(ctx, 33, SSL_MODE_RELEASE_BUFFERS, null);
         ssl = api.SSL_new(ctx);
-        api.SSL_set_fd(ssl, cast(int)this.handle);
+        if ( ssl is null || api.SSL_set_fd(ssl, cast(int)s.handle) != 1 ) {
+            throw failedSetUp(host, "can't create a TLS session");
+        }
+        setPeerName(host);
     }
 
-    private string sslErrorReason() {
-        return to!string(api.ERR_reason_error_string(api.ERR_get_error()));
+    private void useClientCertificate(string host, string keyFile, int keyType, string certFile, int certType) {
+        if ( api.SSL_CTX_use_PrivateKey_file(ctx, keyFile.toStringz(), keyType) != 1
+                || api.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(), certType) != 1 ) {
+            throw failedSetUp(host, "can't load the client key or certificate");
+        }
+    }
+
+    private ConnectError failedSetUp(string host, string what) {
+        return new ConnectError(ConnectStage.tlsHandshake, ConnectCause.local, host, "%s: %s".format(what, describe(api.ERR_get_error())));
+    }
+
+    /// The name of queued error `e`.
+    private string describe(c_ulong e) {
+        if ( e == 0 ) {
+            return "no reason given";
+        }
+        if ( e & ERR_SYSTEM_FLAG ) {
+            return formatSocketError(cast(int)(e & ERR_SYSTEM_MASK));
+        }
+        auto reason = api.ERR_reason_error_string(e);
+        return reason is null ? "error %x".format(e) : to!string(reason);
     }
 
     /**
      * Sets the name sent in SNI and, when the peer is verified, the name its certificate must carry:
      * a DNS name, or an IP address matched against the certificate's IP entries.
      */
-    void setPeerName(string host) {
+    private void setPeerName(string host) {
+        if ( host is null ) {
+            if ( verifyPeer ) {
+                throw new ConnectError(ConnectStage.tlsHandshake, ConnectCause.local, host, "can't verify the peer without its host name");
+            }
+            return;
+        }
         immutable ip = isIpLiteral(host);
         if ( verifyPeer ) {
             auto param = api.SSL_get0_param(ssl);
@@ -936,9 +1315,8 @@ public class OpenSslSocket : Socket {
                 rc = api.X509_VERIFY_PARAM_set1_host(param, host.toStringz(), 0);
             }
             if ( rc != 1 ) {
-                throw new ConnectError("can't set the host name to verify: %s".format(sslErrorReason()));
+                throw failedSetUp(host, "can't set the host name to verify");
             }
-            peerNameSet = true;
         }
         // SNI carries host names only (RFC 6066).
         if ( !ip ) {
@@ -946,24 +1324,58 @@ public class OpenSslSocket : Socket {
         }
     }
 
-    private void handshake() {
-        if ( verifyPeer && !peerNameSet ) {
-            throw new ConnectError("can't verify the peer without its host name");
+    /// Calls `call` on a clear error queue and reads what a failure left behind before anything else can change it.
+    private TlsFailure attempt(scope int delegate() call, out int rc) {
+        api.ERR_clear_error();
+        rc = withoutSigpipe(call);
+        if ( rc > 0 ) {
+            return TlsFailure.init;
         }
-        immutable rc = api.SSL_connect(ssl);
-        if ( rc <= 0 ) {
-            throw new ConnectError("TLS handshake failed: %s".format(handshakeFailure(rc)));
+        immutable osError = lastSocketErrorCode();
+        immutable code = api.SSL_get_error(ssl, rc);
+        return TlsFailure(code, api.ERR_get_error(), osError);
+    }
+
+    /// Runs the handshake on `s` until it is done or `end`.
+    void handshake(Socket s, string host, MonoTime end) {
+        for (;;) {
+            int rc;
+            immutable f = attempt(() => api.SSL_connect(ssl), rc);
+            if ( rc == 1 ) {
+                break;
+            }
+            if ( f.code == SSL_ERROR_WANT_READ || f.code == SSL_ERROR_WANT_WRITE ) {
+                if ( !waitReady(s, f.code == SSL_ERROR_WANT_WRITE, end) ) {
+                    throw new ConnectError(ConnectStage.tlsHandshake, ConnectCause.timeout, host, "TLS handshake timed out");
+                }
+                continue;
+            }
+            throw new ConnectError(ConnectStage.tlsHandshake, handshakeCause(f), host, "TLS handshake failed: %s".format(handshakeFailure(f)));
         }
         if ( verifyPeer ) {
             immutable v = api.SSL_get_verify_result(ssl);
             if ( v != X509_V_OK ) {
-                throw new ConnectError("TLS handshake failed: %s".format(verifyFailure(v)));
+                throw new ConnectError(ConnectStage.tlsHandshake, ConnectCause.certificate, host,
+                    "TLS handshake failed: %s".format(verifyFailure(v)));
             }
         }
     }
 
-    private string handshakeFailure(int rc) {
-        auto r = "SSL error %d, %s".format(api.SSL_get_error(ssl, rc), sslErrorReason());
+    private ConnectCause handshakeCause(TlsFailure f) {
+        if ( verifyPeer && api.SSL_get_verify_result(ssl) != X509_V_OK ) {
+            return ConnectCause.certificate;
+        }
+        if ( f.code == SSL_ERROR_ZERO_RETURN || f.unexpectedEof() ) {
+            return ConnectCause.closed;
+        }
+        if ( immutable e = f.systemError() ) {
+            return connectCause(e);
+        }
+        return ConnectCause.protocol;
+    }
+
+    private string handshakeFailure(TlsFailure f) {
+        auto r = "SSL error %d, %s".format(f.code, f.queued == 0 && f.systemError() != 0 ? formatSocketError(f.systemError()) : describe(f.queued));
         if ( verifyPeer ) {
             immutable v = api.SSL_get_verify_result(ssl);
             if ( v != X509_V_OK ) {
@@ -977,45 +1389,41 @@ public class OpenSslSocket : Socket {
         return "certificate verification error %d (%s)".format(v, to!string(api.X509_verify_cert_error_string(v)));
     }
 
-    @trusted
-    override void connect(Address dest) {
-        super.connect(dest);
-        handshake();
-    }
-    auto connectSSL() {
-        handshake();
-        debug(requests) tracef("ssl socket connected");
-        return this;
-    }
-    @trusted
-    override ptrdiff_t send(scope const(void)[] buf, SocketFlags flags) scope {
-        return api.SSL_write(ssl, buf.ptr, cast(int)buf.length);
-    }
-    override ptrdiff_t send(scope const(void)[] buf) scope {
-        return send(buf, SocketFlags.NONE);
-    }
-    @trusted
-    override ptrdiff_t receive(scope void[] buf, SocketFlags flags) scope {
-        return api.SSL_read(ssl, buf.ptr, cast(int)buf.length);
-    }
-    override ptrdiff_t receive(scope void[] buf) scope {
-        return receive(buf, SocketFlags.NONE);
-    }
-    this(AddressFamily af, SocketType type = SocketType.STREAM, SSLOptions opts = SSLOptions()) {
-        super(af, type);
-        scope(failure) close();
-        initSsl(opts);
-    }
-    /// `ownsHandle` false leaves closing `sock` to whoever opened it.
-    this(socket_t sock, AddressFamily af, SSLOptions opts = SSLOptions(), bool ownsHandle = true) {
-        super(sock, af);
-        this.ownsHandle = ownsHandle;
-        initSsl(opts);
-    }
-    override void close() scope @trusted {
-        if ( ownsHandle ) {
-            super.close();
+    /// The outcome of a TLS call after the handshake that returned `rc` and left `f`.
+    private Io outcome(int rc, TlsFailure f) {
+        if ( rc > 0 ) {
+            return Io(Io.Status.done, rc);
         }
+        switch ( f.code ) {
+            case SSL_ERROR_WANT_READ:
+                return Io(Io.Status.wantRead);
+            case SSL_ERROR_WANT_WRITE:
+                return Io(Io.Status.wantWrite);
+            case SSL_ERROR_ZERO_RETURN:
+                return Io(Io.Status.eof);
+            default:
+                // Whether a body cut short by the peer is complete is for the HTTP framing to tell.
+                if ( f.unexpectedEof() ) {
+                    return Io(Io.Status.eof);
+                }
+                immutable e = f.systemError();
+                return Io(Io.Status.failed, 0, e != 0 && f.queued == 0 ? formatSocketError(e) : "SSL error %d, %s".format(f.code, describe(f.queued)));
+        }
+    }
+
+    Io write(scope const(void)[] buf) {
+        int rc;
+        immutable f = attempt(() => api.SSL_write(ssl, buf.ptr, cast(int)min(buf.length, int.max)), rc);
+        return outcome(rc, f);
+    }
+
+    Io read(scope void[] buf) {
+        int rc;
+        immutable f = attempt(() => api.SSL_read(ssl, buf.ptr, cast(int)min(buf.length, int.max)), rc);
+        return outcome(rc, f);
+    }
+
+    void free() nothrow @nogc {
         if ( ssl !is null ) {
             api.SSL_free(ssl);
             ssl = null;
@@ -1025,94 +1433,56 @@ public class OpenSslSocket : Socket {
             ctx = null;
         }
     }
-    void SSL_set_tlsext_host_name(string host) {
-
-    }
 }
 
+/// A connection over TLS.
 public class SSLSocketStream: SocketStream {
     private SSLOptions _sslOptions;
-    private Socket underlyingSocket;
-    private SSL* ssl;
-    private string host;
+    private TlsSession tls;
 
     this(SSLOptions opts) {
         _sslOptions = opts;
     }
-    this(NetworkStream ostream, SSLOptions opts, string host = null) {
+
+    /// Takes over the connection of `tunnel`, such as one to the origin through a proxy, and runs the handshake with `host`.
+    this(SocketStream tunnel, SSLOptions opts, string host, NetworkLimits limits) {
         _sslOptions = opts;
-        this.host = host;
-        // Left open, the tunnel would stay cached as a connection to the https origin.
-        scope(failure) ostream.close();
-        auto osock = ostream.so();
-        underlyingSocket = osock;
-        osock.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
-        auto ss = new OpenSslSocket(osock.handle, osock.addressFamily, _sslOptions, false);
-        scope(failure) ss.close();
-        ssl = ss.ssl;
-        if ( host !is null ) {
-            ss.setPeerName(host);
-        }
-        ss.connectSSL();
+        _limits = limits;
+        s = tunnel.release();
         __isOpen = true;
+        scope(failure) close();
+        establish(host);
         __isConnected = true;
-        s = ss;
-        debug(requests) tracef("ssl stream created from another stream: %s", s);
     }
-    override void close() {
-        ssl = null;
-        host = null;
-        super.close();
-        if ( underlyingSocket ) {
-            underlyingSocket.close();
-        }
+
+    protected override void establish(string host) {
+        tls = new TlsSession(s, _sslOptions, host);
+        tls.handshake(s, host, limitEnd(MonoTime.currTime, _limits.handshakeTimeout, _limits.deadline));
+        debug(requests) tracef("TLS handshake done");
     }
-    override void open(AddressFamily fa) {
-        if ( s !is null ) {
-            s.close();
-        }
-        auto ss = new OpenSslSocket(fa, SocketType.STREAM, _sslOptions);
-        assert(ss !is null, "Can't create socket");
-        ssl = ss.ssl;
-        s = ss;
-        __isOpen = true;
-        if ( host !is null ) {
-            ss.setPeerName(host);
-        }
-        s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
+
+    protected override Io trySend(const(void)[] buf) {
+        return tls.write(buf);
     }
-    override SocketStream connect(string h, ushort p, Duration timeout = 10.seconds) {
-        host = h;
-        return super.connect(h, p, timeout);
+
+    protected override Io tryReceive(void[] buf) {
+        return tls.read(buf);
     }
-    override SSLSocketStream accept() {
-        auto newso = s.accept();
-        if ( s is null ) {
-            return null;
+
+    protected override void closeSocket() @trusted {
+        if ( tls !is null ) {
+            tls.free();
+            tls = null;
         }
-        auto newstream = new SSLSocketStream(_sslOptions);
-        auto sslSocket = new OpenSslSocket(newso.handle, s.addressFamily);
-        newstream.s = sslSocket;
-        newstream.__isOpen = true;
-        newstream.__isConnected = true;
-        return newstream;
+        super.closeSocket();
     }
 }
+
+/// A plain TCP connection.
 public class TCPSocketStream : SocketStream {
-    override void open(AddressFamily fa) {
-        if ( s !is null ) {
-            s.close();
-        }
-        s = new Socket(fa, SocketType.STREAM, ProtocolType.TCP);
-        assert(s !is null, "Can't create socket");
-        __isOpen = true;
-        s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
-    }
     override TCPSocketStream accept() {
         auto newso = s.accept();
-        if ( s is null ) {
-            return null;
-        }
+        newso.blocking = false;
         auto newstream = new TCPSocketStream();
         newstream.s = newso;
         newstream.__isOpen = true;
@@ -1122,28 +1492,18 @@ public class TCPSocketStream : SocketStream {
     }
 }
 
-/// The error of the last failed socket call: WinSock reports it through `WSAGetLastError` and leaves `errno` alone.
-private int lastSocketErrorCode() @trusted nothrow @nogc {
-    version(Windows) {
-        import core.sys.windows.winsock2 : WSAGetLastError;
-        return WSAGetLastError();
-    } else {
-        return errno;
-    }
-}
-
 public interface NetworkStream {
     @property bool isConnected() const;
     @property bool isOpen() const;
 
     void close() @trusted;
 
-    ///
-    /// timeout is the socket write timeout.
-    ///
-    NetworkStream connect(string host, ushort port, Duration timeout = 10.seconds);
+    /// Connects to `host` at `port` within `limits`, which then also apply to sending and receiving.
+    NetworkStream connect(string host, ushort port, NetworkLimits limits);
 
-    ptrdiff_t send(const(void)[] buff);
+    /// Sends all of `buff`.
+    void send(const(void)[] buff);
+    /// Receives into `buff`; 0 when the peer has closed the connection.
     ptrdiff_t receive(void[] buff);
 
     NetworkStream accept();
@@ -1152,21 +1512,29 @@ public interface NetworkStream {
     void bind(Address);
     void listen(int);
     Socket so();
-    ///
-    /// Set timeout for receive calls. 0 means no timeout.
-    ///
-    @property void readTimeout(Duration timeout);
+    /// Sets the limits on sending and receiving, and starts the low-speed check over.
+    @property void limits(NetworkLimits limits);
 }
 
+/**
+ * A connection over a socket that never blocks: every wait goes through `select` and ends with the stream's limits,
+ * on every OS alike.
+ */
 public abstract class SocketStream : NetworkStream {
     private {
-        Duration timeout;
         Socket   s;
         bool     __isOpen;
         bool     __isConnected;
         string   _bind;
+        NetworkLimits _limits;
+        Duration _windowTime;   // time spent in receive() in the current low-speed window
+        ulong    _windowBytes;  // bytes received in it
     }
+    /// Opens a blocking socket, to bind and listen on.
     void open(AddressFamily fa) {
+        closeSocket();
+        s = new Socket(fa, SocketType.STREAM, ProtocolType.TCP);
+        __isOpen = true;
     }
     @property Socket so() @safe pure {
         return s;
@@ -1178,13 +1546,28 @@ public abstract class SocketStream : NetworkStream {
         return s && __isOpen && __isConnected;
     }
     void close() @trusted {
-        // can be callsed from dtor in GC, no gc calls here
+        closeSocket();
+    }
+    protected void closeSocket() @trusted {
         if ( isOpen ) {
             s.close();
-            __isOpen = false;
-            __isConnected = false;
         }
+        __isOpen = false;
+        __isConnected = false;
         s = null;
+    }
+    /// Hands the socket over to another stream and forgets it.
+    package Socket release() {
+        auto r = s;
+        s = null;
+        __isOpen = false;
+        __isConnected = false;
+        return r;
+    }
+    @property void limits(NetworkLimits limits) {
+        _limits = limits;
+        _windowTime = Duration.zero;
+        _windowBytes = 0;
     }
     /***
     *  bind() just remember address. We will cal bind() at the time of connect as
@@ -1193,96 +1576,216 @@ public abstract class SocketStream : NetworkStream {
     override void bind(string to) {
         _bind = to;
     }
-    /***
-    *  Make connection to remote site. Bind, handle connection error, try several addresses, etc
-    ***/
-    SocketStream connect(string host, ushort port, Duration timeout = 10.seconds) {
-        debug(requests) tracef(format("Create connection to %s:%d", host, port));
-        Address[] addresses;
-        __isConnected = false;
-        try {
-            addresses = getAddress(host, port);
-        } catch (Exception e) {
-            throw new ConnectError("Can't resolve name when connect to %s:%d: %s".format(host, port, e.msg));
-        }
-        foreach(a; addresses) {
+
+    /// Resolves `host` and connects to one of its addresses at `port`, the name and the TCP connection within `connectTimeout`.
+    SocketStream connect(string host, ushort port, NetworkLimits limits) {
+        debug(requests) tracef("Create connection to %s:%d", host, port);
+        immutable phaseEnd = limitEnd(MonoTime.currTime, limits.connectTimeout, limits.deadline);
+        return connect(resolve(host, port, limits.family, phaseEnd), host, limits, phaseEnd);
+    }
+
+    /**
+     * Connects to one of `addresses` of `host` within `limits`. They are tried in turn, each in an equal share of what is
+     * left of `connectTimeout`, so that an address that never answers leaves time for the rest.
+     */
+    SocketStream connect(Address[] addresses, string host, NetworkLimits limits) {
+        return connect(addresses, host, limits, limitEnd(MonoTime.currTime, limits.connectTimeout, limits.deadline));
+    }
+
+    private SocketStream connect(Address[] addresses, string host, NetworkLimits limits, MonoTime phaseEnd) {
+        closeSocket();
+        this.limits = limits;
+        auto last = new ConnectError(ConnectStage.resolve, ConnectCause.notFound, host, "no address to connect to");
+        foreach ( i, a; addresses ) {
+            immutable now = MonoTime.currTime;
+            if ( i > 0 && now >= phaseEnd ) {
+                break;
+            }
+            immutable shareEnd = phaseEnd == MonoTime.max ? phaseEnd : now + (phaseEnd - now) / cast(long)(addresses.length - i);
+            immutable which = "address %d of %d".format(i + 1, addresses.length);
             debug(requests) tracef("Trying %s", a);
             try {
-                open(a.addressFamily);
-                if ( _bind !is null ) {
-                    auto ad = getAddress(_bind);
-                    debug(requests) tracef("bind to %s", ad[0]);
-                    s.bind(ad[0]);
+                openSocket(a.addressFamily, host);
+                immutable rc = connectSocket(s, a, shareEnd);
+                if ( rc == -1 ) {
+                    throw new ConnectError(ConnectStage.tcp, ConnectCause.timeout, host, "TCP connection to %s timed out".format(which));
                 }
-                s.setOption(SocketOptionLevel.SOCKET, SocketOption.SNDTIMEO, timeout);
-                s.connect(a);
-                debug(requests) tracef("Connected to %s", a);
+                if ( rc != 0 ) {
+                    throw new ConnectError(ConnectStage.tcp, connectCause(rc), host,
+                        "TCP connection to %s failed: %s".format(which, formatSocketError(rc)));
+                }
+                s.setOption(SocketOptionLevel.TCP, SocketOption.TCP_NODELAY, 1);
+                establish(host);
                 __isConnected = true;
-                break;
-            } catch (SocketException e) {
-                debug(requests) warningf("Failed to connect to %s:%d(%s): %s", host, port, a, e.msg);
-                s.close();
+                debug(requests) tracef("Connected to %s", a);
+                return this;
             } catch (ConnectError e) {
-                close();
+                closeSocket();
+                // After a TLS failure another address helps only when the network was at fault. A handshake that
+                // timed out has used up handshakeTimeout, which covers the handshake of the whole set-up.
+                immutable retry = e.stage == ConnectStage.tcp
+                    || e.cause == ConnectCause.reset || e.cause == ConnectCause.closed;
+                if ( !retry ) {
+                    throw e;
+                }
+                last = e;
+            } catch (Exception e) {
+                closeSocket();
                 throw e;
             }
         }
-        if ( !__isConnected ) {
-            throw new ConnectError("Can't connect to %s:%d".format(host, port));
-        }
-        return this;
+        throw last;
     }
 
-    ptrdiff_t send(const(void)[] buff)
-    in {assert(isConnected);}
-    do {
-        auto rc = s.send(buff);
-        if (rc < 0) {
-            immutable e = lastSocketErrorCode();
-            close();
-            throw new NetworkException("sending data: %s".format(formatSocketError(e)));
+    /// Opens a non-blocking socket for `af`, bound to `bind()`'s address when there is one.
+    private void openSocket(AddressFamily af, string host) {
+        closeSocket();
+        try {
+            s = new Socket(af, SocketType.STREAM, ProtocolType.TCP);
+            __isOpen = true;
+            s.blocking = false;
+            if ( _bind !is null ) {
+                s.bind(getAddress(_bind)[0]);
+            }
+        } catch (SocketException e) {
+            throw new ConnectError(ConnectStage.tcp, ConnectCause.local, host, "can't open a socket: " ~ e.msg);
         }
-        return rc;
+    }
+
+    /// Completes a new TCP connection with `host`; TLS runs its handshake here.
+    protected void establish(string host) {
+    }
+
+    protected Io trySend(const(void)[] buf) {
+        for (;;) {
+            immutable rc = s.send(buf);
+            if ( rc >= 0 ) {
+                return Io(Io.Status.done, rc);
+            }
+            immutable e = lastSocketErrorCode();
+            if ( interrupted(e) ) {
+                continue;
+            }
+            if ( wouldBlock(e) ) {
+                return Io(Io.Status.wantWrite);
+            }
+            return Io(Io.Status.failed, 0, formatSocketError(e));
+        }
+    }
+
+    protected Io tryReceive(void[] buf) {
+        for (;;) {
+            immutable rc = s.receive(buf);
+            if ( rc > 0 ) {
+                return Io(Io.Status.done, rc);
+            }
+            if ( rc == 0 ) {
+                return Io(Io.Status.eof);
+            }
+            immutable e = lastSocketErrorCode();
+            if ( interrupted(e) ) {
+                continue;
+            }
+            if ( wouldBlock(e) ) {
+                return Io(Io.Status.wantRead);
+            }
+            return Io(Io.Status.failed, 0, formatSocketError(e));
+        }
+    }
+
+    /// The exception for a wait that ran out at `end`.
+    private NetworkException timedOut(MonoTime end, string what) {
+        closeSocket();
+        if ( end == _limits.deadline ) {
+            return new NetworkException(RequestCause.deadline, "the request's deadline passed while " ~ what);
+        }
+        return new NetworkException(RequestCause.timeout, "timed out " ~ what);
+    }
+
+    void send(const(void)[] buff) {
+        if ( !isConnected ) {
+            throw new NetworkException(RequestCause.closed, "sending over a closed connection");
+        }
+        auto end = limitEnd(MonoTime.currTime, _limits.timeout, _limits.deadline);
+        while ( buff.length > 0 ) {
+            auto io = trySend(buff);
+            final switch ( io.status ) {
+                case Io.Status.done:
+                    buff = buff[io.length .. $];
+                    end = limitEnd(MonoTime.currTime, _limits.timeout, _limits.deadline);
+                    break;
+                case Io.Status.wantRead:
+                case Io.Status.wantWrite:
+                    if ( !waitReady(s, io.status == Io.Status.wantWrite, end) ) {
+                        throw timedOut(end, "sending");
+                    }
+                    break;
+                case Io.Status.eof:
+                    closeSocket();
+                    throw new NetworkException(RequestCause.closed, "the peer closed the connection while sending");
+                case Io.Status.failed:
+                    closeSocket();
+                    throw new NetworkException(RequestCause.reset, "sending failed: " ~ io.failure);
+            }
+        }
     }
 
     ptrdiff_t receive(void[] buff) {
-        while (true) {
-            auto r = s.receive(buff);
-            if (r < 0) {
-                immutable e = lastSocketErrorCode();
-                version(Windows) {
-                    import core.sys.windows.winsock2 : WSAETIMEDOUT;
-                    close();
-                    if ( e == WSAETIMEDOUT ) {
-                        throw new TimeoutException("Timeout receiving data");
-                    }
-                    throw new NetworkException("Unexpected error %s while receiving data".format(formatSocketError(e)));
-                }
-                version(Posix) {
-                    if ( e == EINTR ) {
-                        continue;
-                    }
-                    close();
-                    if ( e == EAGAIN ) {
-                        throw new TimeoutException("Timeout receiving data");
-                    }
-                    throw new NetworkException("Unexpected error %s while receiving data".format(formatSocketError(e)));
-                }
-            }
-            else {
-                buff.length = r;
-            }
-            return r;
+        if ( !isConnected ) {
+            return 0;
         }
-        assert(false);
+        immutable checkSpeed = _limits.lowSpeedLimit > 0 && _limits.lowSpeedTime > Duration.zero;
+        auto mark = MonoTime.currTime;  // up to here the time is in the low-speed window
+        immutable end = limitEnd(mark, _limits.timeout, _limits.deadline);
+        for (;;) {
+            auto io = tryReceive(buff);
+            final switch ( io.status ) {
+                case Io.Status.done:
+                    if ( checkSpeed ) {
+                        countSpeed(MonoTime.currTime - mark, io.length);
+                    }
+                    return io.length;
+                case Io.Status.eof:
+                    __isConnected = false;
+                    return 0;
+                case Io.Status.wantRead:
+                case Io.Status.wantWrite:
+                    immutable windowEnd = checkSpeed ? mark + (_limits.lowSpeedTime - _windowTime) : MonoTime.max;
+                    immutable waitEnd = min(end, windowEnd);
+                    if ( waitReady(s, io.status == Io.Status.wantWrite, waitEnd) ) {
+                        break;
+                    }
+                    if ( waitEnd == end ) {
+                        throw timedOut(end, "waiting for data");
+                    }
+                    immutable now = MonoTime.currTime;
+                    countSpeed(now - mark, 0);
+                    mark = now;
+                    break;
+                case Io.Status.failed:
+                    closeSocket();
+                    throw new NetworkException(RequestCause.reset, "receiving failed: " ~ io.failure);
+            }
+        }
     }
 
-    @property void readTimeout(Duration timeout) @safe {
-        if ( __isConnected )
-        {
-            s.setOption(SocketOptionLevel.SOCKET, SocketOption.RCVTIMEO, timeout);
+    /// Adds `bytes` received over `spent` to the low-speed window; checks a full window and starts the next one.
+    private void countSpeed(Duration spent, size_t bytes) {
+        _windowTime += spent;
+        _windowBytes += bytes;
+        if ( _windowTime < _limits.lowSpeedTime ) {
+            return;
         }
+        immutable expected = _limits.lowSpeedLimit * _windowTime.total!"msecs" / 1000;
+        if ( _windowBytes < expected ) {
+            closeSocket();
+            throw new NetworkException(RequestCause.lowSpeed, "received %d bytes in %s, below %d bytes a second"
+                .format(_windowBytes, _windowTime, _limits.lowSpeedLimit));
+        }
+        _windowTime = Duration.zero;
+        _windowBytes = 0;
     }
+
     override SocketStream accept() {
         assert(false, "Implement before use");
     }

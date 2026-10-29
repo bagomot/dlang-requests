@@ -949,7 +949,9 @@ private auto read_request(in App app, NetworkStream stream) {
 }
 
 void processor(in App app, HTTPD httpd, NetworkStream stream) {
-    stream.readTimeout = app.timeout;
+    NetworkLimits limits;
+    limits.timeout = app.timeout;
+    stream.limits = limits;
     HTTPD_Request  rq;
     _Response      rs;
     scope (exit) {
@@ -1002,7 +1004,7 @@ void processor(in App app, HTTPD httpd, NetworkStream stream) {
         debug(httpd)  error("Request exception: " ~ e.msg);
         rs = response(rq, "Request exception:\n" ~ e.msg, 500);
     }
-    catch (TimeoutException e) {
+    catch (NetworkException e) {
         debug(httpd) {
             if ( rq.requestLine ) {
                 error("Timeout reading/writing to client");
@@ -1051,7 +1053,7 @@ class HTTPD
         try {
             addresses = getAddress(host, port);
         } catch (Exception e) {
-            throw new ConnectError("Can't resolve name when connect to %s:%d: %s".format(host, port, e.msg));
+            throw new Exception("Can't resolve name when connect to %s:%d: %s".format(host, port, e.msg));
         }
         auto tcpStream = app.useSSL?
             new SSLStream(_sslOptions):
@@ -1064,7 +1066,7 @@ class HTTPD
         try {
             addresses = getAddress(app.host, app.port);
         } catch (Exception e) {
-            throw new ConnectError("Can't resolve name when connect to %s:%d: %s".format(app.host, app.port, e.msg));
+            throw new Exception("Can't resolve name when connect to %s:%d: %s".format(app.host, app.port, e.msg));
         }
         auto tcpStream = openStream(app);
         tcpStream.reuseAddr(true);
@@ -1109,7 +1111,7 @@ class HTTPD
         _running = false;
         try {
             auto s = openStream(_app);
-            s.connect(_app.host, _app.port);
+            s.connect(_app.host, _app.port, NetworkLimits.init);
         } catch (Exception e) {
         }
         //        _server.stop();

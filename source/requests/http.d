@@ -49,6 +49,13 @@ public class MaxRedirectsException: Exception {
     }
 }
 
+/// What a request sends after its head.
+private enum Payload {
+    params,     /// the parameters: as a form for POST, PUT and PATCH, in the query otherwise
+    range,      /// the data of an input range
+    multipart,  /// a multipart form
+}
+
 ///
 ///
 ///
@@ -153,6 +160,12 @@ public struct HTTPRequest {
         string         _proxy;
         uint           _verbosity = 0;                  // 0 - no output, 1 - headers, 2 - headers+body info
         Duration       _timeout = 30.seconds;
+        Duration       _connectTimeout = 30.seconds;
+        Duration       _handshakeTimeout = 30.seconds;
+        Duration       _deadline;                       // zero - none
+        size_t         _lowSpeedLimit;
+        Duration       _lowSpeedTime;
+        IPFamily       _ipFamily;
         size_t         _bufferSize = 16*1024; // 16k
         bool           _useStreaming;                   // return iterator instead of completed request
 
@@ -161,6 +174,9 @@ public struct HTTPRequest {
         DecodeChunked  _unChunker;
         long           _contentLength;
         long           _contentReceived;
+        ulong          _responseBytes;                  // bytes of the current response, headers included
+        MonoTime       _deadlineAt;
+        Payload        _payload;
         SSLOptions     _sslOptions;
         string         _bind;
         _UH            _userHeaders;
@@ -427,6 +443,11 @@ public struct HTTPRequest {
     package unittest {
         assert(params2query(queryParams("a","b", "c", " d "))=="a=b&c=%20d%20");
     }
+    /// The exception for a response that can't be used, with what of it has arrived.
+    private RequestException responseFailure(RequestCause cause, string message, Throwable next = null,
+            string file = __FILE__, size_t line = __LINE__) {
+        return new RequestException(cause, _uri.host, _responseBytes, message, file, line, next);
+    }
     ///
     /// Analyze received headers, take appropriate actions:
     /// check content length, attach unchunk and uncompress
@@ -442,11 +463,11 @@ public struct HTTPRequest {
                 _contentLength = parse!long(l);
                 // TODO: maybe add a strict mode that checks if l was parsed completely
                 if ( _maxContentLength && _contentLength > _maxContentLength) {
-                    throw new RequestException("ContentLength > maxContentLength (%d>%d)".
+                    throw responseFailure(RequestCause.limit, "ContentLength > maxContentLength (%d>%d)".
                                 format(_contentLength, _maxContentLength));
                 }
             } catch (ConvException e) {
-                throw new RequestException("Can't convert Content-Length from %s".format(*contentLength));
+                throw responseFailure(RequestCause.protocol, "Can't convert Content-Length from %s".format(*contentLength));
             }
         }
         auto transferEncoding = "transfer-encoding" in headers;
@@ -460,7 +481,7 @@ public struct HTTPRequest {
         auto contentEncoding = "content-encoding" in headers;
         if ( contentEncoding ) switch (*contentEncoding) {
             default:
-                throw new RequestException("Unknown content-encoding " ~ *contentEncoding);
+                throw responseFailure(RequestCause.protocol, "Unknown content-encoding " ~ *contentEncoding);
             case "gzip":
             case "deflate":
                 _bodyDecoder.insert(new Decompressor!ubyte);
@@ -488,7 +509,11 @@ public struct HTTPRequest {
                 }
                 auto parsed = line.split(" ");
                 if ( parsed.length >= 2 ) {
-                    _response.code = parsed[1].to!ushort;
+                    try {
+                        _response.code = parsed[1].to!ushort;
+                    } catch (ConvException e) {
+                        throw responseFailure(RequestCause.protocol, "the status line has no valid status code");
+                    }
                     _response._version = _response.parse_version(parsed[0]);
                 }
                 continue;
@@ -600,123 +625,151 @@ public struct HTTPRequest {
         }
         return newURI;
     }
+    /// The limits of the current request on its connection.
+    private NetworkLimits limits() const {
+        NetworkLimits l;
+        l.family = _ipFamily;
+        l.connectTimeout = _connectTimeout;
+        l.handshakeTimeout = _handshakeTimeout;
+        l.timeout = _timeout;
+        l.deadline = _deadlineAt;
+        l.lowSpeedLimit = _lowSpeedLimit;
+        l.lowSpeedTime = _lowSpeedTime;
+        return l;
+    }
     ///
     /// Setup connection. Handle proxy and https case
     ///
-    /// Place new connection in ConnManager cache
+    /// Place the connection in ConnManager cache once it is set up
     ///
-    private NetworkStream setupConnection()
-    do {
-
+    private NetworkStream setupConnection() {
         debug(requests) tracef("Set up new connection");
         NetworkStream stream;
-
-        // on exit
-        // place created connection to conn. manager
-        // close connection purged from manager (if any)
-        //
-        scope(exit) {
-            if ( stream )
-            {
-                if ( auto purged_connection = _cm.put(_uri.scheme, _uri.host, _uri.port, stream) )
-                {
-                    debug(requests) tracef("closing purged connection %s", purged_connection);
-                    purged_connection.close();
-                }
-            }
-        }
-
-        if ( _socketFactory )
-        {
+        if ( _socketFactory ) {
             debug(requests) tracef("use socketFactory");
             stream = _socketFactory(_uri.scheme, _uri.host, _uri.port);
         }
-
-        if ( stream ) // socket factory created connection
-        {
-            return stream;
+        if ( stream is null ) {
+            stream = connect();
         }
-
-        URI   uri; // this URI will be used temporarry if we need proxy
-        string actual_proxy = select_proxy(_uri.scheme);
-        final switch (_uri.scheme) {
-            case"http":
-                if ( actual_proxy ) {
-                    uri.uri_parse(actual_proxy);
-                    uri.idn_encode();
-                } else {
-                    // use original uri
-                    uri = _uri;
-                }
-                stream = new TCPStream();
-                stream.bind(_bind);
-                stream.connect(uri.host, uri.port, _timeout);
-                break ;
-            case"https":
-                if ( actual_proxy ) {
-                    uri.uri_parse(actual_proxy);
-                    uri.idn_encode();
-                    stream = new TCPStream();
-                    stream.bind(_bind);
-                    stream.connect(uri.host, uri.port, _timeout);
-                    if ( verbosity>=1 ) {
-                        writeln("> CONNECT %s:%d HTTP/1.1".format(_uri.host, _uri.port));
-                    }
-                    stream.send("CONNECT %s:%d HTTP/1.1\r\n".format(_uri.host, _uri.port));
-                    if (uri.username)
-                    {
-                        debug(requests) tracef("Add Proxy-Authorization header");
-                        auto auth = new BasicAuthentication(uri.username, uri.password);
-                        auto header = auth.authHeaders("");
-                        stream.send("Proxy-Authorization: %s\r\n".format(header["Authorization"]));
-                    }
-                    stream.send("\r\n");
-                    while ( stream.isConnected ) {
-                        ubyte[1024] b;
-                        auto read = stream.receive(b);
-                        if ( verbosity>=1) {
-                            writefln("< %s", cast(string)b[0..read]);
-                        }
-                        debug(requests) tracef("read: %d", read);
-                        if ( b[0..read].canFind("\r\n\r\n") || b[0..read].canFind("\n\n") ) {
-                            debug(requests) tracef("proxy connection ready");
-                            // convert connection to ssl
-                            stream = new SSLStream(stream, _sslOptions, _uri.host);
-                            break ;
-                        } else {
-                            debug(requests) tracef("still wait for proxy connection");
-                        }
-                    }
-                } else {
-                    uri = _uri;
-                    stream = new SSLStream(_sslOptions);
-                    stream.bind(_bind);
-                    stream.connect(uri.host, uri.port, _timeout);
-                    debug(requests) tracef("ssl connection to origin server ready");
-                }
-                break ;
+        if ( auto purged_connection = _cm.put(_uri.scheme, _uri.host, _uri.port, stream) ) {
+            debug(requests) tracef("closing purged connection %s", purged_connection);
+            purged_connection.close();
         }
-
         return stream;
+    }
+    /// Connects to the origin server, directly or through the proxy.
+    private NetworkStream connect() {
+        immutable actual_proxy = select_proxy(_uri.scheme);
+        if ( !actual_proxy ) {
+            auto stream = _uri.scheme == "https" ? new SSLStream(_sslOptions) : new TCPStream();
+            stream.bind(_bind);
+            return stream.connect(_uri.host, _uri.port, limits());
+        }
+        URI proxy;
+        if ( !proxy.uri_parse(actual_proxy) ) {
+            throw new ConnectError(ConnectStage.tcp, ConnectCause.local, _uri.host, "the proxy URL can't be parsed");
+        }
+        proxy.idn_encode();
+        auto tunnel = new TCPStream();
+        tunnel.bind(_bind);
+        try {
+            tunnel.connect(proxy.host, proxy.port, limits());
+        } catch (ConnectError e) {
+            throw new ConnectError(e.stage, e.cause, _uri.host, "proxy: " ~ e.msg, e.file, e.line, e.next);
+        }
+        if ( _uri.scheme == "http" ) {
+            return tunnel;
+        }
+        scope(failure) tunnel.close();
+        openTunnel(tunnel, proxy);
+        return new SSLStream(tunnel, _sslOptions, _uri.host, limits());
+    }
+    /// Asks the proxy on `tunnel` to connect it to the origin server, within `handshakeTimeout`.
+    private void openTunnel(TCPStream tunnel, ref URI proxy) {
+        immutable authority = "%s:%d".format(_uri.bracketedHost, _uri.port);
+        auto request = "CONNECT %s HTTP/1.1\r\nHost: %s\r\n".format(authority, authority);
+        if ( proxy.username ) {
+            debug(requests) tracef("Add Proxy-Authorization header");
+            auto auth = new BasicAuthentication(proxy.username, proxy.password);
+            request ~= "Proxy-Authorization: %s\r\n".format(auth.authHeaders("")["Authorization"]);
+        }
+        request ~= "\r\n";
+        if ( _verbosity >= 1 ) {
+            writeln("> CONNECT %s HTTP/1.1".format(authority));
+        }
+        NetworkLimits l;
+        l.deadline = limitEnd(MonoTime.currTime, _handshakeTimeout, _deadlineAt);
+        tunnel.limits = l;
+
+        ConnectError failure(ConnectCause cause, string message, Throwable next = null) {
+            return new ConnectError(ConnectStage.proxyConnect, cause, _uri.host, message, __FILE__, __LINE__, next);
+        }
+        ubyte[] answer;
+        ptrdiff_t end = -1;
+        try {
+            tunnel.send(request);
+            while ( end < 0 ) {
+                ubyte[1024] b;
+                immutable read = tunnel.receive(b[]);
+                if ( read == 0 ) {
+                    throw failure(ConnectCause.closed, "the proxy closed the connection before answering CONNECT");
+                }
+                answer ~= b[0 .. read];
+                end = headEnd(answer);
+                if ( end < 0 && answer.length > _maxHeadersLength ) {
+                    throw failure(ConnectCause.protocol, "the proxy's answer to CONNECT is longer than maxHeadersLength");
+                }
+            }
+        } catch (NetworkException e) {
+            final switch ( e.cause ) {
+                case RequestCause.timeout, RequestCause.deadline, RequestCause.lowSpeed:
+                    throw failure(ConnectCause.timeout, "the proxy didn't answer CONNECT in time", e);
+                case RequestCause.reset:
+                    throw failure(ConnectCause.reset, "proxy CONNECT: " ~ e.msg, e);
+                case RequestCause.closed:
+                    throw failure(ConnectCause.closed, "proxy CONNECT: " ~ e.msg, e);
+                case RequestCause.protocol, RequestCause.limit:
+                    throw failure(ConnectCause.protocol, "proxy CONNECT: " ~ e.msg, e);
+            }
+        }
+        auto head = cast(string)answer[0 .. end].idup;
+        if ( _verbosity >= 1 ) {
+            head.splitLines.filter!(l => l.length > 0).each!(l => writefln("< %s", l));
+        }
+        auto status = head.lineSplitter.front.split(' ');
+        if ( status.length < 2 || !status[0].startsWith("HTTP/") || status[1].length != 3 || !status[1].all!isDigit ) {
+            throw failure(ConnectCause.protocol, "the proxy's answer to CONNECT has no valid status line");
+        }
+        // Any 2xx opens the tunnel (RFC 9110, 9.3.6).
+        if ( status[1][0] != '2' ) {
+            throw failure(ConnectCause.proxyStatus, "the proxy answered CONNECT with %s".format(status[1]));
+        }
+        // The origin server can't have spoken yet: TLS starts with the client.
+        if ( answer.length > end ) {
+            throw failure(ConnectCause.protocol, "the proxy sent data after its answer to CONNECT");
+        }
+        debug(requests) tracef("proxy connection ready");
+    }
+    /// Where the head of an HTTP message in `data` ends, past its empty line; -1 while it hasn't ended.
+    private static ptrdiff_t headEnd(const(ubyte)[] data) pure @safe {
+        immutable crlf = data.countUntil("\r\n\r\n".representation);
+        immutable lf = data.countUntil("\n\n".representation);
+        if ( crlf >= 0 && (lf < 0 || crlf < lf) ) {
+            return crlf + 4;
+        }
+        return lf >= 0 ? lf + 2 : -1;
+    }
+    unittest {
+        assert(headEnd("HTTP/1.1 200 OK\r\n\r\n".representation) == 19);
+        assert(headEnd("HTTP/1.1 200 OK\n\nx".representation) == 17);
+        assert(headEnd("HTTP/1.1 200 OK\r\n".representation) == -1);
     }
     ///
     /// Request sent, now receive response.
     /// Find headers, split on headers and body, continue to receive body
     ///
     private void receiveResponse(NetworkStream _stream) {
-
-        try {
-            _stream.readTimeout = timeout;
-        } catch (Exception e) {
-            debug(requests) tracef("Failed to set read timeout for stream: %s", e.msg);
-            return;
-        }
-        // Commented this out as at exit we can have alreade closed socket
-        // scope(exit) {
-        //     if ( _stream && _stream.isOpen ) {
-        //         _stream.readTimeout = 0.seconds;
-        //     }
-        // }
 
         _bodyDecoder = new DataPipe!ubyte();
         scope(exit) {
@@ -739,8 +792,9 @@ public struct HTTPRequest {
 
             debug(requests) tracef("read: %d", read);
             if ( read == 0 ) {
-                break;
+                throw new NetworkException(RequestCause.closed, "the connection closed before the end of the response headers");
             }
+            _responseBytes += read;
             auto data = b[0..read];
             buffer.putNoCopy(data);
             if ( verbosity>=3 ) {
@@ -748,7 +802,7 @@ public struct HTTPRequest {
             }
 
             if ( buffer.length > maxHeadersLength ) {
-                throw new RequestException("Headers length > maxHeadersLength (%d > %d)".format(buffer.length, maxHeadersLength));
+                throw responseFailure(RequestCause.limit, "Headers length > maxHeadersLength (%d > %d)".format(buffer.length, maxHeadersLength));
             }
 
             // Proper HTTP uses "\r\n" as a line separator, but broken servers sometimes use "\n".
@@ -833,6 +887,12 @@ public struct HTTPRequest {
                 auto __bufferSize = _bufferSize;
                 auto __response = _response;
                 auto __verbosity = _verbosity;
+                auto __host = _uri.host;
+                auto __responseBytes = _responseBytes;
+
+                RequestException failure(RequestCause cause, string message, Throwable next = null) {
+                    return new RequestException(cause, __host, __responseBytes, message, __FILE__, __LINE__, next);
+                }
 
                 // set up response
                 _response._contentLength = _contentLength;
@@ -844,8 +904,7 @@ public struct HTTPRequest {
                     while(true) {
                         // check if we received everything we need
                         if ( ( __unChunker && __unChunker.done )
-                            || !__stream.isConnected()
-                            || (__contentLength > 0 && __contentReceived >= __contentLength) )
+                            || (__contentLength >= 0 && __contentReceived >= __contentLength) )
                         {
                             debug(requests) trace("streaming_in receive completed");
                             __bodyDecoder.flush();
@@ -853,16 +912,20 @@ public struct HTTPRequest {
                         }
                         // have to continue
                         auto b = new ubyte[__bufferSize];
+                        ptrdiff_t read;
                         try {
                             read = __stream.receive(b);
                         }
-                        catch (Exception e) {
-                            throw new RequestException("streaming_in error reading from socket", __FILE__, __LINE__, e);
+                        catch (NetworkException e) {
+                            throw failure(e.cause, "streaming_in error reading from socket: " ~ e.msg, e);
                         }
                         debug(requests) tracef("streaming_in received %d bytes", read);
 
                         if ( read == 0 ) {
                             debug(requests) tracef("streaming_in: server closed connection");
+                            if ( __unChunker || __contentLength >= 0 ) {
+                                throw failure(RequestCause.closed, "the connection closed before the end of the body");
+                            }
                             __bodyDecoder.flush();
                             return __bodyDecoder.get();
                         }
@@ -872,7 +935,13 @@ public struct HTTPRequest {
                         }
                         __response._contentReceived += read;
                         __contentReceived += read;
-                        __bodyDecoder.putNoCopy(b[0..read]);
+                        __responseBytes += read;
+                        try {
+                            __bodyDecoder.putNoCopy(b[0..read]);
+                        }
+                        catch (DecodingException e) {
+                            throw failure(RequestCause.protocol, e.msg, e);
+                        }
                         auto res = __bodyDecoder.getNoCopy();
                         if ( res.length == 0 ) {
                             // there were nothing to produce (beginning of the chunk or no decompressed data)
@@ -906,8 +975,13 @@ public struct HTTPRequest {
 
             if ( read == 0 ) {
                 debug(requests) trace("read done");
+                // Without a length or chunking the body ends with the connection.
+                if ( _unChunker || _contentLength >= 0 ) {
+                    throw new NetworkException(RequestCause.closed, "the connection closed before the end of the body");
+                }
                 break;
             }
+            _responseBytes += read;
             if ( _verbosity >= 2 ) {
                 writefln("< %d bytes of body received", read);
             }
@@ -919,7 +993,7 @@ public struct HTTPRequest {
             debug(requests) tracef("read: %d", read);
             _contentReceived += read;
             if ( _maxContentLength && _contentReceived > _maxContentLength ) {
-                throw new RequestException("ContentLength > maxContentLength (%d>%d)".
+                throw responseFailure(RequestCause.limit, "ContentLength > maxContentLength (%d>%d)".
                     format(_contentLength, _maxContentLength));
             }
 
@@ -934,16 +1008,6 @@ public struct HTTPRequest {
         _bodyDecoder.flush();
         _response._responseBody.putNoCopy(_bodyDecoder.get());
         _response._contentReceived = _contentReceived;
-    }
-    ///
-    /// Check that we received anything.
-    /// Server can close previous connection (keepalive or not)
-    ///
-    private bool serverPrematurelyClosedConnection() pure @safe {
-        immutable server_closed_connection = _response._responseHeaders.length == 0 && _response._status_line.length == 0;
-        // debug(requests) tracef("server closed connection = %s (headers.length=%s, status_line.length=%s)",
-        //     server_closed_connection, _response._responseHeaders.length,  _response._status_line.length);
-        return server_closed_connection;
     }
     private bool isIdempotent(in string method) pure @safe nothrow {
         return ["GET", "HEAD"].canFind(method);
@@ -1006,60 +1070,41 @@ public struct HTTPRequest {
         _stream.send("0\r\n\r\n");
     }
 
-    HTTPResponse exec_from_range(InputRangeAdapter postData)
-    do {
-
-        _postData = postData;
-
-        debug(requests) tracef("exec from range");
-
-        NetworkStream _stream;
-        _response = new HTTPResponse;
-        _history.length = 0;
-        _response.uri = _uri;
-        _response.finalURI = _uri;
-        bool restartedRequest = false;
-        bool send_flat;
-
-    connect:
-        _contentReceived = 0;
-        _response._startedAt = Clock.currTime;
-
-        assert(_stream is null);
-
-        _stream = _cm.get(_uri.scheme, _uri.host, _uri.port);
-
-        if ( _stream is null ) {
-            debug(requests) trace("create new connection");
-            _stream = setupConnection();
-        } else {
-            debug(requests) trace("reuse old connection");
-        }
-
-        assert(_stream !is null);
-
-        if ( !_stream.isConnected ) {
-            debug(requests) trace("disconnected stream on enter");
-            if ( !restartedRequest ) {
-                debug(requests) trace("disconnected stream on enter: retry");
-                assert(_cm.get(_uri.scheme, _uri.host, _uri.port) == _stream);
-
-                _cm.del(_uri.scheme, _uri.host, _uri.port);
-                _stream.close();
-                _stream = null;
-
-                restartedRequest = true;
-                goto connect;
-            }
-            debug(requests) trace("disconnected stream on enter: return response");
-            //_stream = null;
-            return _response;
-        }
-        _response._connectedAt = Clock.currTime;
-
+    /// Sends the head; `params` go into the query.
+    private void sendHead(NetworkStream _stream, string[string] h, QueryParam[] params = null) {
         Appender!string req;
-        req.put(requestString());
+        req.put(requestString(params));
+        h.byKeyValue.
+            map!(kv => kv.key ~ ": " ~ kv.value ~ "\r\n").
+            each!(h => req.put(h));
+        req.put("\r\n");
+        debug(requests) trace(req.data);
+        if ( _verbosity >= 1 ) {
+            req.data.splitLines.each!(a => writeln("> " ~ a));
+        }
+        _stream.send(req.data());
+    }
 
+    /// Sends the request with the parameters: as a form for POST, PUT and PATCH, in the query otherwise.
+    private void sendParams(NetworkStream _stream) {
+        auto h = requestHeaders();
+        switch (_method) {
+            case "POST","PUT","PATCH":
+                immutable encoded = params2query(_params);
+                safeSetHeader(h, _userHeaders.ContentType, "Content-Type", "application/x-www-form-urlencoded");
+                safeSetHeader(h, _userHeaders.ContentLength, "Content-Length", to!string(encoded.length));
+                sendHead(_stream, h);
+                if ( encoded.length ) {
+                    _stream.send(encoded);
+                }
+                break;
+            default:
+                sendHead(_stream, h, _params);
+        }
+    }
+
+    /// Sends the request with the data of `_postData`: with Content-Length when its length is known, chunked otherwise.
+    private void sendRange(NetworkStream _stream) {
         auto h = requestHeaders;
         if ( _contentType ) {
             safeSetHeader(h, _userHeaders.ContentType, "Content-Type", _contentType);
@@ -1071,6 +1116,7 @@ public struct HTTPRequest {
             safeSetHeader(h, _userHeaders.ContentLength, "Content-Length", to!string(_postData.length));
         }
 
+        bool send_flat;
         if ( _userHeaders.ContentLength || "Content-Length" in h )
         {
             debug(requests) tracef("User provided content-length for chunked content");
@@ -1081,192 +1127,17 @@ public struct HTTPRequest {
             h["Transfer-Encoding"] = "chunked";
             send_flat = false;
         }
-        h.byKeyValue.
-            map!(kv => kv.key ~ ": " ~ kv.value ~ "\r\n").
-            each!(h => req.put(h));
-        req.put("\r\n");
-
-        debug(requests) tracef("send <%s>", req.data);
-        if ( _verbosity >= 1 ) {
-            req.data.splitLines.each!(a => writeln("> " ~ a));
+        sendHead(_stream, h);
+        if ( send_flat ) {
+            sendFlattenContent(_stream);
+        } else {
+            sendChunkedContent(_stream);
         }
-
-        try {
-            // send headers
-            _stream.send(req.data());
-            // send body
-            if ( send_flat ) {
-                sendFlattenContent(_stream);
-            } else {
-                sendChunkedContent(_stream);
-            }
-            _response._requestSentAt = Clock.currTime;
-            debug(requests) trace("starting receive response");
-            receiveResponse(_stream);
-            debug(requests) trace("finished receive response");
-            _response._finishedAt = Clock.currTime;
-        }
-        catch (NetworkException e)
-        {
-            _stream.close();
-            throw new RequestException("Network error during data exchange");
-        }
-        if ( serverPrematurelyClosedConnection()
-        && !restartedRequest
-        && isIdempotent(_method)
-        ) {
-            ///
-            /// We didn't receive any data (keepalive connectioin closed?)
-            /// and we can restart this request.
-            /// Go ahead.
-            ///
-            debug(requests) tracef("Server closed keepalive connection");
-
-            assert(_cm.get(_uri.scheme, _uri.host, _uri.port) == _stream);
-
-            _cm.del(_uri.scheme, _uri.host, _uri.port);
-            _stream.close();
-            _stream = null;
-
-            restartedRequest = true;
-            goto connect;
-        }
-
-        if ( _useStreaming ) {
-            if ( _response._receiveAsRange.activated ) {
-                debug(requests) trace("streaming_in activated");
-                return _response;
-            } else {
-                // this can happen if whole response body received together with headers
-                _response._receiveAsRange.data = _response.responseBody.data;
-            }
-        }
-
-        close_connection_if_not_keepalive(_stream);
-
-        if ( _verbosity >= 1 ) {
-            writeln(">> Connect time: ", _response._connectedAt - _response._startedAt);
-            writeln(">> Request send time: ", _response._requestSentAt - _response._connectedAt);
-            writeln(">> Response recv time: ", _response._finishedAt - _response._requestSentAt);
-        }
-
-
-        if ( willFollowRedirect ) {
-            if ( _history.length >= _maxRedirects ) {
-                _stream = null;
-                throw new MaxRedirectsException("%d redirects reached maxRedirects %d.".format(_history.length, _maxRedirects));
-            }
-            // "location" in response already checked in canFollowRedirect
-            immutable new_location = *("location" in _response.responseHeaders);
-            immutable current_uri = _uri, next_uri = uriFromLocation(_uri, new_location);
-
-            immutable get_or_head = _method == "GET" || _method == "HEAD";
-            immutable code = _response.code;
-
-            // save current response for history
-            _history ~= _response;
-
-            if ( code == 301 )
-            {
-                // permanent redirect and change method
-                _permanent_redirects[_uri] = new_location;
-                if ( !get_or_head )
-                {
-                    _method = "GET";
-                }
-            }
-            if ( (code == 302 || code == 303) && !get_or_head)
-            {
-                // only change method
-                _method = "GET";
-            }
-            if ( code == 307 )
-            {
-                // no change method, no permanent
-            }
-            if ( code == 308 )
-            {
-                // permanent redirection and do not change method
-                _permanent_redirects[_uri] = new_location;
-            }
-
-            // prepare new response (for redirected request)
-            _response = new HTTPResponse;
-            _response.uri = current_uri;
-            _response.finalURI = next_uri;
-
-            _stream = null;
-
-            // set new uri
-            this._uri = next_uri;
-            debug(requests) tracef("Redirected to %s", next_uri);
-            if ( restartedRequest ) {
-                debug(requests) trace("Rare event: clearing 'restartedRequest' on redirect");
-                restartedRequest = false;
-            }
-            if ( _method == "GET")
-            {
-                return exec_from_parameters();
-            }
-            goto connect;
-        }
-
-        _response._history = _history;
-        return _response;
     }
 
-    HTTPResponse exec_from_multipart_form(MultipartForm form) {
+    /// Sends the request with `_multipartForm`.
+    private void sendMultipart(NetworkStream _stream) {
         import std.uuid;
-        import std.file;
-
-        _multipartForm = form;
-
-        debug(requests) tracef("exec from multipart form");
-
-        NetworkStream _stream;
-        _response = new HTTPResponse;
-        _response.uri = _uri;
-        _response.finalURI = _uri;
-        bool restartedRequest = false;
-
-    connect:
-        _contentReceived = 0;
-        _response._startedAt = Clock.currTime;
-
-        assert(_stream is null);
-
-        _stream = _cm.get(_uri.scheme, _uri.host, _uri.port);
-
-        if ( _stream is null ) {
-            debug(requests) trace("create new connection");
-            _stream = setupConnection();
-        } else {
-            debug(requests) trace("reuse old connection");
-        }
-
-        assert(_stream !is null);
-
-        if ( !_stream.isConnected ) {
-            debug(requests) trace("disconnected stream on enter");
-            if ( !restartedRequest ) {
-                debug(requests) trace("disconnected stream on enter: retry");
-                assert(_cm.get(_uri.scheme, _uri.host, _uri.port) == _stream);
-
-                _cm.del(_uri.scheme, _uri.host, _uri.port);
-                _stream.close();
-                _stream = null;
-
-                restartedRequest = true;
-                goto connect;
-            }
-            debug(requests) trace("disconnected stream on enter: return response");
-            //_stream = null;
-            return _response;
-        }
-        _response._connectedAt = Clock.currTime;
-
-        Appender!string req;
-        req.put(requestString());
 
         string   boundary = randomUUID().toString;
         string[] partHeaders;
@@ -1297,355 +1168,92 @@ public struct HTTPRequest {
         auto h = requestHeaders();
         safeSetHeader(h, _userHeaders.ContentType, "Content-Type", "multipart/form-data; boundary=" ~ boundary);
         safeSetHeader(h, _userHeaders.ContentLength, "Content-Length", to!string(contentLength));
+        sendHead(_stream, h);
 
-        h.byKeyValue.
-        map!(kv => kv.key ~ ": " ~ kv.value ~ "\r\n").
-        each!(h => req.put(h));
-        req.put("\r\n");
-
-        debug(requests) trace(req.data);
-        if ( _verbosity >= 1 ) req.data.splitLines.each!(a => writeln("> " ~ a));
-
-        try {
-            _stream.send(req.data());
-            foreach(ref source; _multipartForm._sources) {
-                debug(requests) tracef("sending part headers <%s>", partHeaders.front);
-                _stream.send(partHeaders.front);
-                partHeaders.popFront;
-                while (true) {
-                    auto chunk = source.input.read();
-                    if ( chunk.length <= 0 ) {
-                        break;
-                    }
-                    _stream.send(chunk);
+        foreach(ref source; _multipartForm._sources) {
+            debug(requests) tracef("sending part headers <%s>", partHeaders.front);
+            _stream.send(partHeaders.front);
+            partHeaders.popFront;
+            while (true) {
+                auto chunk = source.input.read();
+                if ( chunk.length <= 0 ) {
+                    break;
                 }
-                _stream.send("\r\n");
+                _stream.send(chunk);
             }
-            _stream.send("--" ~ boundary ~ "--\r\n");
-            _response._requestSentAt = Clock.currTime;
-            receiveResponse(_stream);
-            _response._finishedAt = Clock.currTime;
+            _stream.send("\r\n");
         }
-        catch (NetworkException e) {
-            errorf("Error sending request: ", e.msg);
-            _stream.close();
-            return _response;
-        }
-
-        if ( serverPrematurelyClosedConnection()
-        && !restartedRequest
-        && isIdempotent(_method)
-        ) {
-            ///
-            /// We didn't receive any data (keepalive connectioin closed?)
-            /// and we can restart this request.
-            /// Go ahead.
-            ///
-            debug(requests) tracef("Server closed keepalive connection");
-
-            assert(_cm.get(_uri.scheme, _uri.host, _uri.port) == _stream);
-
-            _cm.del(_uri.scheme, _uri.host, _uri.port);
-            _stream.close();
-            _stream = null;
-
-            restartedRequest = true;
-            goto connect;
-        }
-
-        if ( _useStreaming ) {
-            if ( _response._receiveAsRange.activated ) {
-                debug(requests) trace("streaming_in activated");
-                return _response;
-            } else {
-                // this can happen if whole response body received together with headers
-                _response._receiveAsRange.data = _response.responseBody.data;
-            }
-        }
-
-        close_connection_if_not_keepalive(_stream);
-
-        if ( _verbosity >= 1 ) {
-            writeln(">> Connect time: ", _response._connectedAt - _response._startedAt);
-            writeln(">> Request send time: ", _response._requestSentAt - _response._connectedAt);
-            writeln(">> Response recv time: ", _response._finishedAt - _response._requestSentAt);
-        }
-
-        if ( willFollowRedirect ) {
-            if ( _history.length >= _maxRedirects ) {
-                _stream = null;
-                throw new MaxRedirectsException("%d redirects reached maxRedirects %d.".format(_history.length, _maxRedirects));
-            }
-            // "location" in response already checked in canFollowRedirect
-            immutable new_location = *("location" in _response.responseHeaders);
-            immutable current_uri = _uri;
-            immutable next_uri = uriFromLocation(_uri, new_location);
-
-            immutable get_or_head = _method == "GET" || _method == "HEAD";
-            immutable code = _response.code;
-
-            // save current response for history
-            _history ~= _response;
-
-            if ( code == 301 )
-            {
-                // permanent redirect and change method
-                _permanent_redirects[_uri] = new_location;
-                if ( !get_or_head )
-                {
-                    _method = "GET";
-                }
-            }
-            if ( (code == 302 || code == 303) && !get_or_head)
-            {
-                // only change method
-                _method = "GET";
-            }
-            if ( code == 307 )
-            {
-                // no change method, no permanent
-            }
-            if ( code == 308 )
-            {
-                // permanent redirection and do not change method
-                _permanent_redirects[_uri] = new_location;
-            }
-
-            // prepare new response (for redirected request)
-            _response = new HTTPResponse;
-            _response.uri = current_uri;
-            _response.finalURI = next_uri;
-            _stream = null;
-
-            // set new uri
-            this._uri = next_uri;
-            debug(requests) tracef("Redirected to %s", next_uri);
-            if ( restartedRequest ) {
-                debug(requests) trace("Rare event: clearing 'restartedRequest' on redirect");
-                restartedRequest = false;
-            }
-            if ( _method == "GET")
-            {
-                return exec_from_parameters();
-            }
-            goto connect;
-        }
-
-        _response._history = _history;
-        return _response;
+        _stream.send("--" ~ boundary ~ "--\r\n");
     }
 
-    HTTPResponse exec_from_parameters() {
+    /**
+     * Sends the request over a cached connection or a new one and receives the response. When a cached connection turns
+     * out to be closed before any byte of the response, an idempotent request goes once more over a new one.
+     */
+    private NetworkStream exchange() {
+        bool resent;
+        for (;;) {
+            _contentReceived = 0;
+            _responseBytes = 0;
+            _response._startedAt = Clock.currTime;
 
-        debug(requests) tracef("exec from parameters request");
-
-        assert(_uri != URI.init);
-        NetworkStream _stream;
-        _response = new HTTPResponse;
-        _history.length = 0;
-        _response.uri = _uri;
-        _response.finalURI = _uri;
-        bool restartedRequest = false; // True if this is restarted keepAlive request
-
-    connect:
-        if ( _method == "GET" && _uri in _permanent_redirects ) {
-            debug(requests) trace("use parmanent redirects cache");
-            _uri = uriFromLocation(_uri, _permanent_redirects[_uri]);
-            _response._finalURI = _uri;
-        }
-        _contentReceived = 0;
-        _response._startedAt = Clock.currTime;
-
-        assert(_stream is null);
-
-        _stream = _cm.get(_uri.scheme, _uri.host, _uri.port);
-
-        if ( _stream is null ) {
-            debug(requests) trace("create new connection");
-            _stream = setupConnection();
-        } else {
-            debug(requests) trace("reuse old connection");
-        }
-
-        assert(_stream !is null);
-
-        if ( !_stream.isConnected ) {
-            debug(requests) trace("disconnected stream on enter");
-            if ( !restartedRequest ) {
-                debug(requests) trace("disconnected stream on enter: retry");
-                assert(_cm.get(_uri.scheme, _uri.host, _uri.port) == _stream);
-
+            auto _stream = _cm.get(_uri.scheme, _uri.host, _uri.port);
+            if ( _stream !is null && !_stream.isConnected ) {
+                debug(requests) trace("disconnected stream in the cache");
                 _cm.del(_uri.scheme, _uri.host, _uri.port);
                 _stream.close();
                 _stream = null;
-
-                restartedRequest = true;
-                goto connect;
             }
-            debug(requests) trace("disconnected stream on enter: return response");
-            //_stream = null;
-            return _response;
-        }
-        _response._connectedAt = Clock.currTime;
-
-        auto h = requestHeaders();
-
-        Appender!string req;
-
-        string encoded;
-
-        switch (_method) {
-            case "POST","PUT","PATCH":
-                encoded = params2query(_params);
-                safeSetHeader(h, _userHeaders.ContentType, "Content-Type", "application/x-www-form-urlencoded");
-                safeSetHeader(h, _userHeaders.ContentLength, "Content-Length", to!string(encoded.length));
-                req.put(requestString());
-                break;
-            default:
-                req.put(requestString(_params));
-        }
-
-        h.byKeyValue.
-        map!(kv => kv.key ~ ": " ~ kv.value ~ "\r\n").
-        each!(h => req.put(h));
-        req.put("\r\n");
-        if ( encoded ) {
-            req.put(encoded);
-        }
-
-        debug(requests) trace(req.data);
-        if ( _verbosity >= 1 ) {
-            req.data.splitLines.each!(a => writeln("> " ~ a));
-        }
-        //
-        // Now send request and receive response
-        //
-        try {
-            _stream.send(req.data());
-            _response._requestSentAt = Clock.currTime;
-            debug(requests) trace("starting receive response");
-            receiveResponse(_stream);
-            debug(requests) tracef("done receive response");
-            _response._finishedAt = Clock.currTime;
-        }
-        catch (NetworkException e) {
-            // On SEND this can means:
-            // we started to send request to the server, but it closed connection because of keepalive timeout.
-            // We have to restart request if possible.
-
-            // On RECEIVE - if we received something - then this exception is real and unexpected error.
-            // If we didn't receive anything - we can restart request again as it can be
-            debug(requests) tracef("Exception on receive response: %s", e.msg);
-            if ( _response._responseHeaders.length != 0 )
-            {
-                _stream.close();
-                throw new RequestException("Unexpected network error");
-            }
-        }
-
-        if ( serverPrematurelyClosedConnection()
-            && !restartedRequest
-            && isIdempotent(_method)
-            ) {
-            ///
-            /// We didn't receive any data (keepalive connectioin closed?)
-            /// and we can restart this request.
-            /// Go ahead.
-            ///
-            debug(requests) tracef("Server closed keepalive connection");
-
-            assert(_cm.get(_uri.scheme, _uri.host, _uri.port) == _stream);
-
-            _cm.del(_uri.scheme, _uri.host, _uri.port);
-            _stream.close();
-            _stream = null;
-
-            restartedRequest = true;
-            goto connect;
-        }
-
-        if ( _useStreaming ) {
-            if ( _response._receiveAsRange.activated ) {
-                debug(requests) trace("streaming_in activated");
-                return _response;
+            immutable reused = _stream !is null;
+            if ( reused ) {
+                debug(requests) trace("reuse old connection");
             } else {
-                // this can happen if whole response body received together with headers
-                _response._receiveAsRange.data = _response.responseBody.data;
+                debug(requests) trace("create new connection");
+                _stream = setupConnection();
             }
-        }
+            _response._connectedAt = Clock.currTime;
+            _stream.limits = limits();
 
-        close_connection_if_not_keepalive(_stream);
-
-        if ( _verbosity >= 1 ) {
-            writeln(">> Connect time: ", _response._connectedAt - _response._startedAt);
-            writeln(">> Request send time: ", _response._requestSentAt - _response._connectedAt);
-            writeln(">> Response recv time: ", _response._finishedAt - _response._requestSentAt);
-        }
-
-        if ( willFollowRedirect ) {
-            debug(requests) trace("going to follow redirect");
-            if ( _history.length >= _maxRedirects ) {
-                _stream = null;
-                throw new MaxRedirectsException("%d redirects reached maxRedirects %d.".format(_history.length, _maxRedirects));
-            }
-            // "location" in response already checked in canFollowRedirect
-            immutable new_location = *("location" in _response.responseHeaders);
-            immutable current_uri = _uri;
-            immutable next_uri = uriFromLocation(_uri, new_location);
-
-            immutable get_or_head = _method == "GET" || _method == "HEAD";
-            immutable code = _response.code;
-
-            // save current response for history
-            _history ~= _response;
-
-            if ( code == 301 )
-            {
-                // permanent redirect and change method
-                _permanent_redirects[_uri] = new_location;
-                if ( !get_or_head )
-                {
-                    _method = "GET";
+            try {
+                final switch ( _payload ) {
+                    case Payload.params:
+                        sendParams(_stream);
+                        break;
+                    case Payload.range:
+                        sendRange(_stream);
+                        break;
+                    case Payload.multipart:
+                        sendMultipart(_stream);
+                        break;
                 }
+                _response._requestSentAt = Clock.currTime;
+                debug(requests) trace("starting receive response");
+                receiveResponse(_stream);
+                debug(requests) trace("finished receive response");
+                _response._finishedAt = Clock.currTime;
+                return _stream;
+            } catch (Exception e) {
+                // What is left of the exchange would be read as the next response.
+                _cm.del(_uri.scheme, _uri.host, _uri.port);
+                _stream.close();
+                if ( auto ne = cast(NetworkException) e ) {
+                    // A server may close a kept-alive connection just as the request goes out.
+                    if ( reused && !resent && _responseBytes == 0 && isIdempotent(_method)
+                        && (ne.cause == RequestCause.closed || ne.cause == RequestCause.reset) ) {
+                        debug(requests) tracef("Server closed keepalive connection");
+                        resent = true;
+                        continue;
+                    }
+                    throw responseFailure(ne.cause, ne.msg, ne);
+                }
+                if ( auto de = cast(DecodingException) e ) {
+                    throw responseFailure(RequestCause.protocol, de.msg, de);
+                }
+                throw e;
             }
-            if ( (code == 302 || code == 303) && !get_or_head)
-            {
-                // only change method
-                _method = "GET";
-            }
-            if ( code == 307 )
-            {
-                // no change method, no permanent
-            }
-            if ( code == 308 )
-            {
-                // permanent redirection and do not change method
-                _permanent_redirects[_uri] = new_location;
-            }
-
-            // prepare new response (for redirected request)
-            _response = new HTTPResponse;
-            _response.uri = current_uri;
-            _response.finalURI = next_uri;
-            _stream = null;
-
-            // set new uri
-            _uri = next_uri;
-            debug(requests) tracef("Redirected to %s", next_uri);
-            //if ( _method != "GET" && _response.code != 307 && _response.code != 308 ) {
-            //    // 307 and 308 do not change method
-            //    return exec_from_parameters(r);
-            //}
-            if ( restartedRequest ) {
-                debug(requests) trace("Rare event: clearing 'restartedRequest' on redirect");
-                restartedRequest = false;
-            }
-            goto connect;
         }
-
-        _response._history = _history;
-        return _response;
     }
+
     HTTPResponse execute(Request r)
     {
         _method = r.method;
@@ -1661,6 +1269,12 @@ public struct HTTPRequest {
         _bufferSize = r.bufferSize;
         _proxy = r.proxy;
         _timeout = r.timeout;
+        _connectTimeout = r.connectTimeout;
+        _handshakeTimeout = r.handshakeTimeout;
+        _deadline = r.deadline;
+        _lowSpeedLimit = r.lowSpeedLimit;
+        _lowSpeedTime = r.lowSpeedTime;
+        _ipFamily = r.ipFamily;
         _contentType = r.contentType;
         _socketFactory = r.socketFactory;
         _sslOptions = r.sslOptions;
@@ -1669,6 +1283,8 @@ public struct HTTPRequest {
         _userHeaders = r.userHeaders;
 
         _params = r.params;
+        _postData = r.postData;
+        _multipartForm = r.multipartForm;
 
         // this assignments increments refCounts, so we can't use const Request
         // but Request is anyway struct and called by-value
@@ -1676,15 +1292,91 @@ public struct HTTPRequest {
         _cookie = r.cookie;
 
         debug(requests) trace("serving %s".format(r));
-        if ( !r.postData.empty)
-        {
-            return exec_from_range(r.postData);
+        _deadlineAt = limitEnd(MonoTime.currTime, _deadline, MonoTime.max);
+        _payload = !_postData.empty ? Payload.range : r.hasMultipartForm ? Payload.multipart : Payload.params;
+        _history.length = 0;
+        _response = new HTTPResponse;
+        _response.uri = _uri;
+        _response.finalURI = _uri;
+
+        for (;;) {
+            if ( _payload == Payload.params && _method == "GET" && _uri in _permanent_redirects ) {
+                debug(requests) trace("use parmanent redirects cache");
+                _uri = uriFromLocation(_uri, _permanent_redirects[_uri]);
+                _response._finalURI = _uri;
+            }
+
+            auto _stream = exchange();
+
+            if ( _useStreaming ) {
+                if ( _response._receiveAsRange.activated ) {
+                    debug(requests) trace("streaming_in activated");
+                    return _response;
+                } else {
+                    // this can happen if whole response body received together with headers
+                    _response._receiveAsRange.data = _response.responseBody.data;
+                }
+            }
+
+            close_connection_if_not_keepalive(_stream);
+
+            if ( _verbosity >= 1 ) {
+                writeln(">> Connect time: ", _response._connectedAt - _response._startedAt);
+                writeln(">> Request send time: ", _response._requestSentAt - _response._connectedAt);
+                writeln(">> Response recv time: ", _response._finishedAt - _response._requestSentAt);
+            }
+
+            if ( !willFollowRedirect ) {
+                _response._history = _history;
+                return _response;
+            }
+            debug(requests) trace("going to follow redirect");
+            if ( _history.length >= _maxRedirects ) {
+                throw new MaxRedirectsException("%d redirects reached maxRedirects %d.".format(_history.length, _maxRedirects));
+            }
+            // "location" in response already checked in canFollowRedirect
+            immutable new_location = *("location" in _response.responseHeaders);
+            immutable current_uri = _uri;
+            immutable next_uri = uriFromLocation(_uri, new_location);
+
+            immutable get_or_head = _method == "GET" || _method == "HEAD";
+            immutable code = _response.code;
+
+            // save current response for history
+            _history ~= _response;
+
+            if ( code == 301 )
+            {
+                // permanent redirect and change method
+                _permanent_redirects[_uri] = new_location;
+                if ( !get_or_head )
+                {
+                    _method = "GET";
+                }
+            }
+            if ( (code == 302 || code == 303) && !get_or_head)
+            {
+                // only change method
+                _method = "GET";
+            }
+            if ( code == 308 )
+            {
+                // permanent redirection and do not change method
+                _permanent_redirects[_uri] = new_location;
+            }
+
+            // prepare new response (for redirected request)
+            _response = new HTTPResponse;
+            _response.uri = current_uri;
+            _response.finalURI = next_uri;
+
+            // set new uri
+            _uri = next_uri;
+            debug(requests) tracef("Redirected to %s", next_uri);
+            if ( _method == "GET" ) {
+                // GET sends no body
+                _payload = Payload.params;
+            }
         }
-        if ( r.hasMultipartForm )
-        {
-            return exec_from_multipart_form(r.multipartForm);
-        }
-        auto rs = exec_from_parameters();
-        return rs;
     }
 }
