@@ -47,6 +47,7 @@ private extern (C) nothrow @nogc {
     void SSL_CTX_set_verify(SSL_CTX* ctx, int mode, void* callback);
     int SSL_CTX_use_PrivateKey_file(SSL_CTX* ctx, const(char)* file, int type);
     int SSL_CTX_use_certificate_file(SSL_CTX* ctx, const(char)* file, int type);
+    int SSL_CTX_check_private_key(const(SSL_CTX)* ctx);
     SSL* SSL_new(SSL_CTX* ctx);
     void SSL_free(SSL* ssl);
     int SSL_set_fd(SSL* ssl, int fd);
@@ -83,6 +84,7 @@ private enum libsslFunctions = [
     "SSL_CTX_set_verify",
     "SSL_CTX_use_PrivateKey_file",
     "SSL_CTX_use_certificate_file",
+    "SSL_CTX_check_private_key",
     "SSL_new",
     "SSL_free",
     "SSL_set_fd",

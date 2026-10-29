@@ -5,7 +5,7 @@ A hard fork of [ikod/dlang-requests](https://github.com/ikod/dlang-requests), an
 ## Differences from upstream
 
 - TLS verifies that the server's certificate is issued for the requested host name, in its subjectAltName and never by its subject's CN, or IP address, directly and through a `CONNECT` proxy. It takes TLS 1.2 or newer. A failed handshake throws `ConnectError` and closes the socket.
-- With a CA file set by `sslSetCaCert`, only that file is trusted, and one that can't be loaded is an error.
+- With a CA file set by `sslSetCaCert`, only that file is trusted, and one that can't be loaded is an error, as is a client key or certificate that can't be loaded or a key that doesn't match the certificate: `ConnectError(tlsHandshake, local)`.
 - OpenSSL is bound on the first TLS connection, not at start-up. When it can't be loaded, isn't version 3 or 4 or lacks a function, that connection and every later one throw `OpenSSLUnavailableException`; plain HTTP keeps working.
 - OpenSSL is initialized without reading `openssl.cnf`, so `OPENSSL_CONF` can't load modules into the process, and without cleanup from `atexit`.
 - OpenSSL can be linked statically, see below.

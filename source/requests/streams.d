@@ -1418,6 +1418,10 @@ private final class TlsSession {
                 || api.SSL_CTX_use_certificate_file(ctx, certFile.toStringz(), certType) != 1 ) {
             throw failedSetUp(host, "can't load the client key or certificate");
         }
+        // Loading a certificate drops a key that doesn't match it, and the handshake would go on without either.
+        if ( api.SSL_CTX_check_private_key(ctx) != 1 ) {
+            throw failedSetUp(host, "the client key doesn't match the client certificate");
+        }
     }
 
     private ConnectError failedSetUp(string host, string what) {

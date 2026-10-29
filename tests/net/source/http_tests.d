@@ -836,7 +836,7 @@ unittest {
         "%d direct, %d from the factory, asked %s".format(atomicLoad(direct.accepted), atomicLoad(server.accepted), asked));
 }
 
-@("a server that asks for a client certificate takes the one set and no client without one, and a key that can't be loaded is a local failure")
+@("a server that asks for a client certificate takes the one set and no client without one, and a key that can't be loaded or doesn't match is a local failure")
 unittest {
     auto server = new TlsServer("localhost", (string head) => okResponse, false, cert("ca.pem"));
     scope (exit) server.stop();
@@ -868,6 +868,14 @@ unittest {
     auto ce = collectException!ConnectError(missing.get(url));
     enforce(ce !is null && ce.stage == ConnectStage.tlsHandshake && ce.cause == ConnectCause.local
         && ce.msg.canFind("can't load the client key"), ce is null ? "accepted" : ce.msg);
+
+    auto mismatched = client();
+    mismatched.sslSetCertFile(cert("client.pem"));
+    mismatched.sslSetKeyFile(cert("server.key"));
+    ce = collectException!ConnectError(mismatched.get(url));
+    enforce(ce !is null && ce.stage == ConnectStage.tlsHandshake && ce.cause == ConnectCause.local
+        && ce.msg.canFind("doesn't match"), ce is null ? "accepted" : "%s/%s: %s".format(ce.stage, ce.cause, ce.msg));
+    enforce(atomicLoad(server.served) == 1);
 }
 
 @("the userinfo of a proxy URL goes to the proxy as Proxy-Authorization on CONNECT, and nowhere else")
