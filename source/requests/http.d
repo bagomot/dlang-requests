@@ -1109,6 +1109,7 @@ public struct HTTPRequest {
         _cm.del(scheme, host, port, proxy);
 
         RequestException failure(RequestCause cause, string message, Throwable next) {
+            finished = true;
             incoming.stream.close();
             return new RequestException(cause, host, incoming.bytes, message, __FILE__, __LINE__, next);
         }
@@ -1117,6 +1118,12 @@ public struct HTTPRequest {
         response.receiveAsRange.activated = true;
         response.receiveAsRange.data = response._responseBody.data;
         response.receiveAsRange.cm = _cm;
+        response.receiveAsRange.closeConnection = delegate void () {
+            if ( !finished ) {
+                finished = true;
+                incoming.stream.close();
+            }
+        };
         response.receiveAsRange.read = delegate ubyte[] () {
             if ( finished ) {
                 return null;

@@ -427,6 +427,49 @@ unittest {
     enforce(lines == iota(500).map!(i => "line %03d\n".format(i)).array, "%d lines".format(lines.length));
 }
 
+@("close ends a streamed body left before its end at once, and does nothing to one read to its end")
+unittest {
+    import core.atomic : atomicStore;
+    import std.socket : Socket;
+
+    shared bool closed;
+    auto server = new ScriptedServer((Socket c, ScriptedServer s) {
+        c.send("HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\n" ~ "x".replicate(1000));
+        // Until the client closes the connection.
+        s.holdOpen(c);
+        atomicStore(closed, true);
+    }, true);
+    scope (exit) server.stop();
+    auto rq = client();
+    rq.useStreaming = true;
+    rq.bufferSize = 100;
+    auto rs = rq.get("http://127.0.0.1:%d/".format(server.port));
+    auto range = rs.receiveAsRange;
+    range.popFront();
+    enforce(!range.empty);
+    range.close();
+    enforce(range.empty);
+    immutable end = MonoTime.currTime + 2.seconds;
+    while (!atomicLoad(closed) && MonoTime.currTime < end) {
+        Thread.sleep(10.msecs);
+    }
+    enforce(atomicLoad(closed), "the connection is still open");
+
+    auto whole = new HttpServer((Received r) => response("whole body"));
+    scope (exit) whole.stop();
+    immutable url = "http://127.0.0.1:%d/".format(whole.port);
+    auto kept = client();
+    kept.keepAlive = true;
+    kept.useStreaming = true;
+    // Shorter than the body, so that the body comes through the range rather than with the head.
+    kept.bufferSize = 4;
+    auto first = kept.get(url);
+    enforce(receiveAll(first) == "whole body");
+    first.receiveAsRange.close();
+    enforce(receiveAll(kept.get(url)) == "whole body" && atomicLoad(whole.accepted) == 1,
+        "%d connections".format(atomicLoad(whole.accepted)));
+}
+
 @("redirects are followed by relative and absolute locations into the history, and maxRedirects 0 returns the redirect itself")
 unittest {
     HttpServer server;

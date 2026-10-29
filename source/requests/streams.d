@@ -1548,6 +1548,38 @@ private final class TlsSession {
             ctx = null;
         }
     }
+
+    // A stream dropped open, such as with a streamed body left unread, leaves its session to the collector. Freeing
+    // touches neither the GC heap nor the socket.
+    ~this() {
+        free();
+    }
+}
+
+version (unittest) {
+    private __gshared OpenSSL countingApi;
+    private __gshared int sslFreed, ctxFreed;
+
+    private extern (C) void countSslFree(SSL*) nothrow @nogc {
+        ++sslFreed;
+    }
+
+    private extern (C) void countCtxFree(SSL_CTX*) nothrow @nogc {
+        ++ctxFreed;
+    }
+}
+
+unittest {
+    countingApi.SSL_free = &countSslFree;
+    countingApi.SSL_CTX_free = &countCtxFree;
+    // A session from its initial state: the constructor would need OpenSSL and a socket.
+    auto memory = typeid(TlsSession).initializer.dup;
+    auto session = cast(TlsSession) memory.ptr;
+    session.api = &countingApi;
+    session.ssl = cast(SSL*) 1;
+    session.ctx = cast(SSL_CTX*) 1;
+    destroy(session);
+    assert(sslFreed == 1 && ctxFreed == 1);
 }
 
 /// A connection over TLS.

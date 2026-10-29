@@ -232,11 +232,24 @@ public struct ReceiveAsRange {
             data.length = 0;
         }
     }
+    /**
+     * Leaves the body, dropping what of it is unread. A connection still receiving it is closed at once rather than
+     * when the collector gets to it; one the body has come over to its end is left alone.
+     */
+    void close() {
+        if ( closeConnection ) {
+            closeConnection();
+        }
+        data = null;
+        read = null;
+    }
     package {
         bool                    activated;
         ubyte[]                 data;
         /// HTTP module set up delegate read() for reading next portion of data.
         ubyte[]                 delegate() read;
+        /// and closeConnection() for leaving the body before its end
+        void                    delegate() closeConnection;
         RefCounted!ConnManager  cm;
     }
 }
