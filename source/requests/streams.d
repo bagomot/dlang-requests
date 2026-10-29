@@ -1671,7 +1671,7 @@ public interface NetworkStream {
     /// Receives into `buff`; 0 when the peer has closed the connection.
     ptrdiff_t receive(void[] buff);
 
-    /// Binds the connection to local address `to` when it connects.
+    /// Binds the connection to local IP address `to` when it connects; a name is a `ConnectError(tcp, local)`.
     void bind(string to);
     Socket so();
     /// Sets the limits on sending and receiving, and starts the low-speed check over.
@@ -1798,12 +1798,16 @@ public abstract class SocketStream : NetworkStream {
     /// Opens a non-blocking socket for `af`, bound to `bind()`'s address when there is one.
     private void openSocket(AddressFamily af, string host) {
         closeSocket();
+        // A name would be resolved here, outside connectTimeout, and again for each address.
+        if ( _bind.length && !isIpLiteral(_bind) ) {
+            throw new ConnectError(ConnectStage.tcp, ConnectCause.local, host, "the local address to bind to is not an IP address");
+        }
         try {
             s = new Socket(af, SocketType.STREAM, ProtocolType.TCP);
             __isOpen = true;
             s.blocking = false;
-            if ( _bind !is null ) {
-                s.bind(getAddress(_bind)[0]);
+            if ( _bind.length ) {
+                s.bind(parseAddress(_bind));
             }
         } catch (SocketException e) {
             throw new ConnectError(ConnectStage.tcp, ConnectCause.local, host, "can't open a socket: " ~ e.msg);

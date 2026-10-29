@@ -10,7 +10,7 @@ A hard fork of [ikod/dlang-requests](https://github.com/ikod/dlang-requests), an
 - OpenSSL is initialized without reading `openssl.cnf`, so `OPENSSL_CONF` can't load modules into the process, and without cleanup from `atexit`.
 - OpenSSL can be linked statically, see below.
 - Every network phase has a time limit of its own, on non-blocking sockets and the same on every OS (a zero `Duration` is no limit):
-  - `connectTimeout` (30 s): resolving the host name and connecting over TCP, all its addresses together. The addresses are tried in turn, each in an equal share of what is left; `ipFamily` keeps to IPv4 or IPv6 ones;
+  - `connectTimeout` (30 s): resolving the host name and connecting over TCP, all its addresses together. The addresses are tried in turn, each in an equal share of what is left; `ipFamily` keeps to IPv4 or IPv6 ones; `bind` takes only an IP address, which needs no resolving;
   - `handshakeTimeout` (30 s): the whole TLS handshake, and the proxy's answer to `CONNECT`;
   - `timeout` (30 s): each wait for sending to progress or for data to arrive;
   - `deadline` (none): the whole request, redirects and a streamed body included;

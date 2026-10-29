@@ -783,6 +783,11 @@ unittest {
     auto e = collectException!ConnectError(rq.get(url));
     enforce(e !is null && e.stage == ConnectStage.tcp && e.cause == ConnectCause.local,
         e is null ? "connected" : "%s/%s: %s".format(e.stage, e.cause, e.msg));
+    // A name would be resolved outside connectTimeout.
+    rq.bind = "localhost";
+    e = collectException!ConnectError(rq.get(url));
+    enforce(e !is null && e.stage == ConnectStage.tcp && e.cause == ConnectCause.local
+        && e.msg.canFind("not an IP address"), e is null ? "connected" : "%s/%s: %s".format(e.stage, e.cause, e.msg));
     enforce(atomicLoad(server.accepted) == 1);
 
     // A kept-alive connection serves only a request that would set it up the same way.

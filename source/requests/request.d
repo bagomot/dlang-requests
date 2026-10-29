@@ -101,7 +101,7 @@ $(TABLE
  $(TR
   $(TD bind)
   $(TD `string`)
-  $(TD use local address for outgoing connections)
+  $(TD use local IP address for outgoing connections)
   $(TD `null`)
  )
  $(TR
@@ -284,7 +284,7 @@ public struct Request {
         bool                    _sslSetVerifyPeer = true;
         SSLOptions              _sslOptions;
 
-        /// bind outgoing connections to this addr (name or ip)
+        /// bind outgoing connections to this IP address
         string                  _bind;
 
         _UH                     _userHeaders;
