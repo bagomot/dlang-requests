@@ -4,7 +4,7 @@ A hard fork of [ikod/dlang-requests](https://github.com/ikod/dlang-requests), an
 
 ## Differences from upstream
 
-- TLS verifies that the server's certificate is issued for the requested host name or IP address, directly and through a `CONNECT` proxy. A failed handshake throws `ConnectError` and closes the socket.
+- TLS verifies that the server's certificate is issued for the requested host name, in its subjectAltName and never by its subject's CN, or IP address, directly and through a `CONNECT` proxy. It takes TLS 1.2 or newer. A failed handshake throws `ConnectError` and closes the socket.
 - With a CA file set by `sslSetCaCert`, only that file is trusted, and one that can't be loaded is an error.
 - OpenSSL is bound on the first TLS connection, not at start-up. When it can't be loaded, isn't version 3 or 4 or lacks a function, that connection and every later one throw `OpenSSLUnavailableException`; plain HTTP keeps working.
 - OpenSSL is initialized without reading `openssl.cnf`, so `OPENSSL_CONF` can't load modules into the process, and without cleanup from `atexit`.
@@ -15,9 +15,16 @@ A hard fork of [ikod/dlang-requests](https://github.com/ikod/dlang-requests), an
   - `timeout` (30 s): each wait for sending to progress or for data to arrive;
   - `deadline` (none): the whole request, redirects and a streamed body included;
   - `lowSpeedLimit` and `lowSpeedTime` (off): fail a transfer that receives fewer bytes a second over that time, a streamed body included.
-- Failures are typed. `ConnectError` tells the `stage` of setting up the connection (`resolve`, `tcp`, `proxyConnect`, `tlsHandshake`) and the `cause` (`timeout`, `refused`, `reset`, `certificate`, ...); `RequestException`, after the connection is set up, its `cause` (`timeout`, `deadline`, `lowSpeed`, `reset`, `closed`, `protocol`, `limit`) and how many `bytesReceived` of the response arrived. Both carry the request's `host`, and their messages carry no host names or addresses. Nothing else escapes a request: `TimeoutException` is gone.
-- A connection that closes before the end of the response, by its `Content-Length` or chunks, fails the request with `RequestCause.closed` rather than returning a short body or code 0.
-- A request is sent again only over a new connection in place of a cached one that closed before answering, and only for GET and HEAD. A connection that failed is never kept.
+- Failures are typed. `ConnectError` tells the `stage` of setting up the connection (`resolve`, `tcp`, `proxyConnect`, `tlsHandshake`) and the `cause` (`timeout`, `refused`, `reset`, `certificate`, ...); `RequestException` any other failure: its `cause` (`invalid`, `timeout`, `deadline`, `lowSpeed`, `reset`, `closed`, `protocol`, `limit`, `redirect`) and how many `bytesReceived` of the response arrived. Both carry the request's `host`, and their messages carry no host names or addresses. Nothing else escapes a request: `TimeoutException` and `MaxRedirectsException` are gone.
+- A request that can't be sent as it is fails with `RequestCause.invalid` before any connection: a method or header name that is not a token, a header value with a control character other than HTAB, a target with a control character or a space.
+- Responses are parsed strictly (RFC 9112): a control character in the head, a malformed status or header line, `Transfer-Encoding` other than `chunked` or together with `Content-Length`, a `Content-Length` that is not one number, or a malformed chunk fails the request with `RequestCause.protocol`. Interim 1xx responses are skipped, and all the heads together are bound by `maxHeadersLength`, trailer fields included. Bytes past the end of a response are dropped with the connection.
+- A connection that closes before the end of the response, by its `Content-Length` or chunks, fails the request with `RequestCause.closed` rather than returning a short body or code 0. A body without either is read until the connection closes, streamed or not.
+- `maxContentLength` (64 MiB, zero for none) bounds the body both as sent, its chunks decoded, and decompressed, a streamed body too.
+- Redirects follow `Location` as a reference resolved against the current URL (RFC 3986). They are refused with `RequestCause.redirect` to another scheme than http and https, from https to http, to what is not a URI in ASCII, past `maxRedirects`, and when they would send a body read from a range or a multipart form again. `Authorization`, `Proxy-Authorization`, `Cookie` and `Host` set by the caller and the authenticator's headers go only to the origin of the URL asked for, and stop once a redirect has left it. Parameters that go into the query go only into the first request; a redirect that turns the method into GET drops the body with its `Content-Length` and `Content-Type`.
+- A cookie is taken from each `Set-Cookie`, its attributes are not cookies, and it replaces one of the same name and path. `Domain` is not taken, so a cookie goes back only to the host that set it; a `Secure` one comes and goes only over https; `Max-Age` of zero or less or `Expires` in the past removes it.
+- Traces of `debug(requests)` and `verbosity` 1 and 2 hide the values of `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie` and the authenticator's headers, and show no bodies, proxy URL or userinfo; `toString` of a request or response leaves the userinfo out. `verbosity` 3 still prints the raw bytes of responses.
+- A proxy URL must be `http://`. A URL's fragment is never sent, nor its userinfo to a proxy.
+- A request is sent again only over a new connection in place of a cached one that closed before answering, only for GET and HEAD, and not with a body from a range or a multipart form. A connection that failed is never kept, and one whose body is streamed is kept apart from other requests until the body is in.
 - `CONNECT` sends `Host`, puts an IPv6 address in brackets and needs a 2xx answer. URLs take an IPv6 address in brackets.
 - The environment's `http_proxy`, `https_proxy` and `all_proxy` are used only with `useEnvironmentProxy`; a null `proxy` connects directly.
 - On Linux a write to a TLS connection the peer has closed doesn't raise SIGPIPE: it is blocked in the writing thread meanwhile, and the process's handler is left alone.
@@ -45,10 +52,11 @@ No test talks to anything outside the machine.
 ```
 dub test                    # unit tests of the library
 cd tests/http && dub test   # requests against a local HTTP server
-cd tests/net && dub test    # TLS, connection set-up, time limits and errors against local servers and proxies
+cd tests/net && dub test    # TLS, connection set-up, time limits, errors, redirects, response parsing and limits,
+                            # request checks, cookies and traces, against local servers and proxies
 ```
 
-The network tests print the OpenSSL version they run with. On Windows, put the OpenSSL DLLs into `tests/net` before running them. To run them with OpenSSL linked statically, point `OPENSSL_LIB_DIR` at the directory of the static libraries; on Linux this configuration also links the system libcurl:
+The network tests print the OpenSSL version they run with. On Windows, put the OpenSSL DLLs into `tests/net` before running them. With `dub test --debug=requests` they check the traces too. To run them with OpenSSL linked statically, point `OPENSSL_LIB_DIR` at the directory of the static libraries; on Linux this configuration also links the system libcurl:
 
 ```
 cd tests/net && OPENSSL_LIB_DIR=<dir> dub test -c openssl-static
