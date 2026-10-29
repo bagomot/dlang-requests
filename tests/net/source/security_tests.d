@@ -322,6 +322,27 @@ unittest {
     assert(atomicLoad(server.accepted) == 0);
 }
 
+@("a URL that can't be parsed, of another scheme or whose host name is not a valid IDN is refused before connecting, by each execute")
+unittest {
+    auto server = serving((target) => okResponse);
+    scope (exit) server.stop();
+    immutable urls = ["http://127.0.0.1 x:%d/".format(server.port), "http://127.0.0.1:99999/",
+        "ftp://127.0.0.1:%d/".format(server.port), "http://тест-.example:%d/".format(server.port)];
+    foreach (url; urls) {
+        void delegate()[] calls = [
+            { client().execute("POST", url, "data"); },
+            { client().execute("POST", url, MultipartForm().add(formData("a", "1"))); },
+            { client().execute("GET", url); },
+        ];
+        foreach (call; calls) {
+            auto e = expectFailure(RequestCause.invalid, call);
+            enforce(e.host is null && e.bytesReceived == 0 && !e.msg.canFind("127.0.0.1") && !e.msg.canFind("тест"),
+                "%s: %s".format(url, e.msg));
+        }
+    }
+    assert(atomicLoad(server.accepted) == 0);
+}
+
 @("a cookie goes back only to the host that set it, one for each name, and a Secure one never over http")
 unittest {
     auto server = serving((target) => target == "/set"

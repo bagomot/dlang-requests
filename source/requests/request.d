@@ -160,6 +160,7 @@ import requests.http;
 import requests.streams;
 import requests.base;
 import requests.uri;
+import requests.idna : IDNAException;
 
 import std.datetime;
 import std.conv;
@@ -625,11 +626,22 @@ public struct Request {
     {
         return execute("DELETE", uri, params);
     }
+    /// Takes `url` for the next request: one that can't be parsed or whose host IDNA refuses can't be sent.
+    private void takeUrl(string url) {
+        try {
+            _uri = URI(url);
+            _uri.idn_encode();
+        } catch (UriException e) {
+            throw new RequestException(RequestCause.invalid, null, 0, "the URL can't be parsed");
+        } catch (IDNAException e) {
+            // Its message names the host.
+            throw new RequestException(RequestCause.invalid, null, 0, "the host name of the URL is not a valid IDN");
+        }
+    }
     Response execute(R)(string method, string url, R content, string ct = "application/octet-stream") if (isBodyRange!R)
     {
+        takeUrl(url);
         _method = method;
-        _uri = URI(url);
-        _uri.idn_encode();
         _params = null;
         _multipartForm = MultipartForm.init;
         _contentType = ct;
@@ -651,9 +663,8 @@ public struct Request {
     }
     Response execute(string method, string url, MultipartForm form)
     {
+        takeUrl(url);
         _method = method;
-        _uri = URI(url);
-        _uri.idn_encode();
         _params = null;
         _postData = InputRangeAdapter.init;
         _multipartForm = form;
@@ -676,9 +687,8 @@ public struct Request {
     }
     Response execute(string method, string url, QueryParam[] params = null)
     {
+        takeUrl(url);
         _method = method;
-        _uri = URI(url);
-        _uri.idn_encode();
         _multipartForm = MultipartForm.init;
         _postData = InputRangeAdapter.init;
         _params = params;
