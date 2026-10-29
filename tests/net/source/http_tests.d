@@ -538,6 +538,17 @@ unittest {
     auto targets = server.received.map!(r => r.target).array;
     enforce(targets == ["/301", "/new", "/new", "/308", "/new", "/new", "/302", "/new", "/302", "/new", "/301", "/new"],
         "%s".format(targets));
+
+    // The parameters of the next request would go into the query of a location given for other ones.
+    auto search = new HttpServer((Received r) => r.target.startsWith("/search?")
+        ? redirect(301, "/found?" ~ r.target["/search?".length .. $]) : response("found"));
+    scope (exit) search.stop();
+    immutable searchUrl = "http://127.0.0.1:%d/search".format(search.port);
+    auto searching = client();
+    searching.get(searchUrl, ["q": "a"]);
+    searching.get(searchUrl, ["q": "b"]);
+    auto searched = search.received.map!(r => r.target).array;
+    enforce(searched == ["/search?q=a", "/found?q=a", "/search?q=b", "/found?q=b"], "%s".format(searched));
 }
 
 /// An authenticator that notes the hosts it is asked for.

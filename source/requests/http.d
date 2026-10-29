@@ -1545,7 +1545,8 @@ public struct HTTPRequest {
         _response.finalURI = _uri;
 
         for (;;) {
-            if ( _payload == Payload.params && _method == "GET" && _uri in _permanent_redirects ) {
+            // The location answered a request without parameters, which would go into its query.
+            if ( _payload == Payload.params && _method == "GET" && _params.length == 0 && _uri in _permanent_redirects ) {
                 debug(requests) trace("use parmanent redirects cache");
                 follow(redirectTarget(_uri, _permanent_redirects[_uri]));
                 _response._finalURI = _uri;
@@ -1584,6 +1585,7 @@ public struct HTTPRequest {
             immutable current_uri = _uri;
             immutable next_uri = redirectTarget(_uri, new_location);
             immutable code = _response.code;
+            immutable permanent = (code == 301 || code == 308) && _params.length == 0;
 
             // 301, 302 and 303 turn a request other than GET and HEAD into a GET, and these send no body.
             if ( _method != "GET" && _method != "HEAD" && (code == 301 || code == 302 || code == 303) ) {
@@ -1604,7 +1606,7 @@ public struct HTTPRequest {
 
             // save current response for history
             _history ~= _response;
-            if ( code == 301 || code == 308 ) {
+            if ( permanent ) {
                 _permanent_redirects[_uri] = new_location;
             }
 
