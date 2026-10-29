@@ -89,10 +89,22 @@ struct URI {
             hp = i[0];
         }
 
-        i = hp.findSplit(":");
-        _original_host = i[0];
-        _host = i[0];
-        _port = i[2].length ? to!ushort(i[2]) : standard_ports[_scheme];
+        string port;
+        if ( hp.startsWith("[") ) {
+            // An IPv6 address, in brackets so that its colons don't read as the port's (RFC 3986, 3.2.2).
+            auto h = hp[1..$].findSplit("]");
+            if ( !h[1].length || h[0].empty || (h[2].length && h[2][0] != ':') ) {
+                return false;
+            }
+            _host = h[0];
+            port = h[2].length ? h[2][1..$] : null;
+        } else {
+            i = hp.findSplit(":");
+            _host = i[0];
+            port = i[2];
+        }
+        _original_host = _host;
+        _port = port.length ? to!ushort(port) : standard_ports[_scheme];
 
         if ( up.length ) {
             i = up.findSplit(":");
@@ -121,7 +133,7 @@ struct URI {
             }
             userinfo ~= "@";
         }
-        string r = "%s://%s%s".format(_scheme, userinfo, _host);
+        string r = "%s://%s%s".format(_scheme, userinfo, bracketedHost);
         if ( _scheme !in standard_ports || standard_ports[_scheme] != _port ) {
             r ~= ":%d".format(_port);
         }
@@ -139,6 +151,10 @@ struct URI {
     mixin(Getter_Setter!string("path"));
     mixin(Getter("query"));
     mixin(Getter("original_host"));
+    /// The host as it goes into a URI or a `Host` header: an IPv6 address in brackets.
+    @property string bracketedHost() const pure @safe {
+        return _host.canFind(':') ? "[" ~ _host ~ "]" : _host;
+    }
     @property void query(string s) {
         if ( s[0]=='?' ) {
             _query = s;
@@ -210,5 +226,17 @@ unittest {
     a.idn_encode();
     assert(a.host == "xn--registrera-domn-elb.se");
     assertThrown!UriException(URI("cnn://deeplink?section=livetv&subsection=sliver&stream=CNN1"));
+    a = URI("https://[::1]:8443/p?q");
+    assert(a.host == "::1" && a.bracketedHost == "[::1]" && a.port == 8443 && a.path == "/p");
+    a.idn_encode();
+    assert(a.host == "::1");
+    assert(a.uri == "https://[::1]:8443/p?q");
+    a = URI("http://u:p@[2001:db8::1]/");
+    assert(a.host == "2001:db8::1" && a.port == 80 && a.username == "u");
+    assert(a.uri == "http://u:p@[2001:db8::1]/");
+    assert(URI("http://127.0.0.1:81/").bracketedHost == "127.0.0.1");
+    assertThrown!UriException(URI("http://[::1/"));
+    assertThrown!UriException(URI("http://[]/"));
+    assertThrown!UriException(URI("http://[::1]x/"));
 }
 

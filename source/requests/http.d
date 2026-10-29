@@ -366,7 +366,7 @@ public struct HTTPRequest {
 
         if ( !_userHeaders.Host )
         {
-            generatedHeaders["Host"] = _uri.host;
+            generatedHeaders["Host"] = _uri.bracketedHost;
             if ( _uri.scheme !in standard_ports || _uri.port != standard_ports[_uri.scheme] ) {
                 generatedHeaders["Host"] ~= ":%d".format(_uri.port);
             }
