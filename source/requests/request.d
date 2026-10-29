@@ -93,6 +93,12 @@ $(TABLE
   $(TD `null`)
  )
  $(TR
+  $(TD useEnvironmentProxy)
+  $(TD `bool`)
+  $(TD without `proxy`, take it from `http_proxy`, `https_proxy`, `all_proxy`)
+  $(TD `false`)
+ )
+ $(TR
   $(TD bind)
   $(TD `string`)
   $(TD use local address for outgoing connections)
@@ -256,6 +262,7 @@ public struct Request {
 
         /// http/https proxy
         string                  _proxy;
+        bool                    _useEnvironmentProxy;
 
         /// content type for POST/PUT requests
         string                  _contentType;                     // content type for POST/PUT payloads
@@ -349,11 +356,11 @@ public struct Request {
     mixin(Getter_Setter!uint("verbosity"));
     mixin(Getter_Setter!Auth("authenticator"));
     /// set proxy property.
-    /// $(B v) - full url to proxy.
-    ///
-    /// Note that we recognize proxy settings from process environment (see $(LINK https://github.com/ikod/dlang-requests/issues/46)):
-    /// you can use http_proxy, https_proxy, all_proxy (as well as uppercase names).
+    /// $(B v) - full url to proxy; null, the default, connects directly unless `useEnvironmentProxy` is set.
     mixin(Getter_Setter!string("proxy"));
+    /// Without a `proxy`, take the proxy from the environment: `http_proxy`, `https_proxy` by the URL's scheme, then
+    /// `all_proxy`, in lower or upper case. Off by default: the environment is not consulted.
+    mixin(Getter_Setter!bool("useEnvironmentProxy"));
     mixin(Getter_Setter!string("method"));
     mixin(Getter("uri"));
     mixin(Getter("params"));

@@ -28,21 +28,6 @@ static immutable ushort[] redirectCodes = [301, 302, 303, 307, 308];
 enum   HTTP11 = 101;
 enum   HTTP10 = 100;
 
-static immutable string[string] proxies;
-shared static this() {
-    import std.process;
-    import std.string;
-    foreach(p; ["http", "https", "all"])
-    {
-        auto v = environment.get(p ~ "_proxy", environment.get(p.toUpper() ~ "_PROXY"));
-        if ( v !is null && v.length > 0 )
-        {
-            debug(requests) tracef("will use %s for %s as proxy", v, p);
-            proxies[p] = v;
-        }
-    }
-}
-
 public class MaxRedirectsException: Exception {
     this(string message, string file = __FILE__, size_t line = __LINE__, Throwable next = null) @safe pure nothrow {
         super(message, file, line, next);
@@ -158,6 +143,7 @@ public struct HTTPRequest {
         size_t         _maxHeadersLength = 32 * 1024;   // 32 KB
         size_t         _maxContentLength;               // 0 - Unlimited
         string         _proxy;
+        bool           _useEnvironmentProxy;
         uint           _verbosity = 0;                  // 0 - no output, 1 - headers, 2 - headers+body info
         Duration       _timeout = 30.seconds;
         Duration       _connectTimeout = 30.seconds;
@@ -289,24 +275,22 @@ public struct HTTPRequest {
         }
         return a.data();
     }
+    /// The proxy for `scheme`: the one set, or with `useEnvironmentProxy` the one in `<scheme>_proxy` or `all_proxy`
+    /// (either case); null for none.
     string select_proxy(string scheme) {
-        if ( _proxy is null && proxies.length == 0 ) {
-            debug(requests) tracef("proxy=null");
-            return null;
-        }
         if ( _proxy ) {
             debug(requests) tracef("proxy=%s", _proxy);
             return _proxy;
         }
-        auto p = scheme in proxies;
-        if ( p !is null && *p != "") {
-            debug(requests) tracef("proxy=%s", *p);
-            return *p;
-        }
-        p = "all" in proxies;
-        if ( p !is null && *p != "") {
-            debug(requests) tracef("proxy=%s", *p);
-            return *p;
+        if ( _useEnvironmentProxy ) {
+            import std.process : environment;
+            foreach ( name; [scheme, "all"] ) {
+                auto p = environment.get(name ~ "_proxy", environment.get(name.toUpper() ~ "_PROXY"));
+                if ( p.length > 0 ) {
+                    debug(requests) tracef("proxy=%s", p);
+                    return p;
+                }
+            }
         }
         debug(requests) tracef("proxy=null");
         return null;
@@ -652,7 +636,7 @@ public struct HTTPRequest {
         if ( stream is null ) {
             stream = connect();
         }
-        if ( auto purged_connection = _cm.put(_uri.scheme, _uri.host, _uri.port, stream) ) {
+        if ( auto purged_connection = _cm.put(_uri.scheme, _uri.host, _uri.port, select_proxy(_uri.scheme), stream) ) {
             debug(requests) tracef("closing purged connection %s", purged_connection);
             purged_connection.close();
         }
@@ -1197,10 +1181,11 @@ public struct HTTPRequest {
             _responseBytes = 0;
             _response._startedAt = Clock.currTime;
 
-            auto _stream = _cm.get(_uri.scheme, _uri.host, _uri.port);
+            immutable proxy = select_proxy(_uri.scheme);
+            auto _stream = _cm.get(_uri.scheme, _uri.host, _uri.port, proxy);
             if ( _stream !is null && !_stream.isConnected ) {
                 debug(requests) trace("disconnected stream in the cache");
-                _cm.del(_uri.scheme, _uri.host, _uri.port);
+                _cm.del(_uri.scheme, _uri.host, _uri.port, proxy);
                 _stream.close();
                 _stream = null;
             }
@@ -1234,7 +1219,7 @@ public struct HTTPRequest {
                 return _stream;
             } catch (Exception e) {
                 // What is left of the exchange would be read as the next response.
-                _cm.del(_uri.scheme, _uri.host, _uri.port);
+                _cm.del(_uri.scheme, _uri.host, _uri.port, proxy);
                 _stream.close();
                 if ( auto ne = cast(NetworkException) e ) {
                     // A server may close a kept-alive connection just as the request goes out.
@@ -1268,6 +1253,7 @@ public struct HTTPRequest {
         _keepAlive = r.keepAlive;
         _bufferSize = r.bufferSize;
         _proxy = r.proxy;
+        _useEnvironmentProxy = r.useEnvironmentProxy;
         _timeout = r.timeout;
         _connectTimeout = r.connectTimeout;
         _handshakeTimeout = r.handshakeTimeout;

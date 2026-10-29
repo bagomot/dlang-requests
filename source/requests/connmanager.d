@@ -14,13 +14,13 @@ import cachetools.cache;
 
 /**
  * Keep opened connections for HTTP.
- * It is actually cache over tuple(schema, host, port) -> connection
+ * It is actually cache over tuple(schema, host, port, proxy) -> connection
  * with limited number of items.
  *
  * Evict least used.
 */
 package struct ConnManager {
-    package alias  CMKey = Tuple!(string, string, ushort);
+    package alias  CMKey = Tuple!(string, string, ushort, string);
     package struct CMValue {
         NetworkStream   stream;
         SysTime         timestamp;
@@ -44,12 +44,12 @@ package struct ConnManager {
     /// If nothing evicted return null. Returned(evicted) connection can be
     /// closed.
     ///
-    NetworkStream put(string schema, string host, ushort port, NetworkStream stream)
+    NetworkStream put(string schema, string host, ushort port, string proxy, NetworkStream stream)
     in { assert(stream !is null);}
     out{ assert(__cache.length>0);}
     do {
         NetworkStream e;
-        CMKey     key = CMKey(schema, host, port);
+        CMKey     key = CMKey(schema, host, port, proxy);
         CMValue value = {stream: stream, timestamp: Clock.currTime};
         __cache.put(key, value);
         auto cacheEvents = __cache.cacheEvents();
@@ -66,11 +66,11 @@ package struct ConnManager {
     /**
         Lookup connection.
      */
-    NetworkStream get(string schema, string host, ushort port)
+    NetworkStream get(string schema, string host, ushort port, string proxy)
     do
     {
         if ( __cache is null ) return null;
-        auto v = __cache.get(CMKey(schema, host, port));
+        auto v = __cache.get(CMKey(schema, host, port, proxy));
         if ( ! v.isNull() )
         {
             return v.get.stream;
@@ -81,9 +81,9 @@ package struct ConnManager {
     /**
         Remove connection from cache (without close).
      */
-    NetworkStream del(string schema, string host, ushort port) {
+    NetworkStream del(string schema, string host, ushort port, string proxy) {
         NetworkStream s;
-        CMKey key = CMKey(schema, host, port);
+        CMKey key = CMKey(schema, host, port, proxy);
         __cache.remove(key);
         auto cacheEvents = __cache.cacheEvents();
         switch( cacheEvents.length )
@@ -128,28 +128,35 @@ unittest {
     auto s1 = new TCPStream();
     auto s2 = new TCPStream();
 
-    auto e = cm.put("http", "s0", 1, s0);
+    auto e = cm.put("http", "s0", 1, null, s0);
     assert(e is null);
-    assert(cm.get("http", "s0", 1) == s0);
+    assert(cm.get("http", "s0", 1, null) == s0);
 
-    e = cm.put("http", "s1", 1, s1);
+    e = cm.put("http", "s1", 1, null, s1);
     assert(e is null);
-    assert(cm.get("http", "s1", 1) == s1);
+    assert(cm.get("http", "s1", 1, null) == s1);
 
-    e = cm.put("http", "s2", 1, s2);
+    e = cm.put("http", "s2", 1, null, s2);
     assert(e !is null);
-    assert(cm.get("http", "s2", 1) == s2);
+    assert(cm.get("http", "s2", 1, null) == s2);
     assert(e == s0); // oldest
     e.close();
 
     // at this moment we have s1, s2
     // let try to update s1
     auto s3 = new TCPStream;
-    e = cm.put("http", "s1", 1, s3);
+    e = cm.put("http", "s1", 1, null, s3);
     assert(e == s1);
     e.close();
-    assert(cm.get("http", "s1", 1) == s3);
+    assert(cm.get("http", "s1", 1, null) == s3);
+    // through a proxy the same origin is another connection
+    auto s4 = new TCPStream;
+    e = cm.put("http", "s1", 1, "http://proxy.test:3128", s4);
+    assert(e == s2);
+    e.close();
+    assert(cm.get("http", "s1", 1, "http://proxy.test:3128") == s4);
+    assert(cm.get("http", "s1", 1, null) == s3);
 
     cm.clear();
-    assert(cm.get("http", "s1", 1) is null);
+    assert(cm.get("http", "s1", 1, null) is null);
 }
